@@ -786,6 +786,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
     }
     free(j);
+    { extern void spu_taskset_task_ended(void); spu_taskset_task_ended(); }
 }
 
 #ifdef _WIN32
@@ -1098,10 +1099,24 @@ void spu_taskset_line_committed(uint32_t line)
 static _Thread_local int s_cur_task = -1;
 int spu_workload_current_task(void) { return s_cur_task; }
 
+/* Tasks that have waited for a signal once and are now running out of the
+ * wait: the SPU work in flight. The GCM walker reads it to keep a recompiled
+ * RSX, which runs a frame in no time, from overtaking that work where a real
+ * RSX would still be drawing (GCM_PARK_SPU_HOLD_MS, cellGcmSys.c). */
+static volatile long s_tasks_out_of_wait;
+static _Thread_local int s_task_out;
+long spu_taskset_tasks_running(void) { return __atomic_load_n(&s_tasks_out_of_wait, __ATOMIC_ACQUIRE); }
+/* A task that ends while out of a wait is no longer running. */
+void spu_taskset_task_ended(void)
+{
+    if (s_task_out) { s_task_out = 0; __atomic_fetch_sub(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL); }
+}
+
 int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
     s_cur_task = (int)taskId;
+    if (s_task_out) { s_task_out = 0; __atomic_fetch_sub(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL); }
     /* ran= is the wall time this task spent OUT of the wait (decode/mix work
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
@@ -1187,6 +1202,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
+    s_task_out = 1; __atomic_fetch_add(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL);
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
     { static int _x = -1; if (_x < 0) _x = getenv("SPU_WAITSIG_EXITLOG") ? 1 : 0;

@@ -2243,9 +2243,12 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
+            /* The count restarts with every run, so "poll #1" printed once
+             * per policy run: gated like exit-to-kernel above. */
+            { static SPU_THREAD_LOCAL int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_t && (n <= 4 || (n % 4096) == 0))
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
+                        n, ctx->gpr[3]._u32[0]); }
             /* The kernel's selection refreshes tempArea, here as on entry. */
             { extern void spurs_kernel_temp_area_refresh(spu_context*);
               spurs_kernel_temp_area_refresh(ctx); }

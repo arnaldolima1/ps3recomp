@@ -704,6 +704,8 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
+/* The park the walker last stopped on (GCM_PARK_SPU_HOLD_MS), ~0 = none. */
+static u32 s_last_park_off = ~0u;
 
 void cellGcm_request_tick(void)
 {
@@ -1811,8 +1813,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
                       }
                   }
+                  s_last_park_off = s_fifo_getoff;
                   why = "parked";
                   break;
+              }
+              /* GCM_PARK_SPU_HOLD_MS=<ms>: a park the title has now patched
+               * into a JUMP starts its next segment, the next frame. A real
+               * RSX spends a frame's time drawing it; this one spends none,
+               * so the frame's reports land while the SPU work they feed is
+               * still on the last one. Hold the patched park while SPURS
+               * tasks are running (out of WAIT_SIGNAL), for up to <ms>.
+               * God of War: Ascension skips its post-process ACQUIRE on the
+               * first frame and relies on that time: RsxSync's signal for
+               * round 2 was eaten by tasks still in round 1's barriers. Off
+               * by default. */
+              if (s_fifo_getoff == s_last_park_off) {
+                  static long hold = -1; static unsigned long long held_since;
+                  if (hold < 0) { const char* e = getenv("GCM_PARK_SPU_HOLD_MS"); hold = e ? atol(e) : 0; }
+                  extern long spu_taskset_tasks_running(void) __attribute__((weak));
+                  if (hold > 0 && spu_taskset_tasks_running && spu_taskset_tasks_running() > 0) {
+                      extern unsigned long long ps3_ms_now(void);
+                      const unsigned long long now = ps3_ms_now();
+                      if (!held_since) held_since = now;
+                      if (now - held_since < (unsigned long long)hold) { why = "spu-hold"; break; }
+                  }
+                  held_since = 0;
+                  s_last_park_off = ~0u;
               }
               s_fifo_getoff = tgt; }
             continue;
@@ -2161,9 +2187,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
     /* A blocked semaphore ACQUIRE (GCM_SEMA_ACQUIRE=1) is not stuck either: the
      * GPU waits there by design until the label is released. Ascension's
      * frame waits on a label its SPU post-process tasks write when they are
-     * done with the frame; following put dropped the frame mid-wait. */
+     * done with the frame; following put dropped the frame mid-wait. Nor is
+     * a patched park held for SPU work (GCM_PARK_SPU_HOLD_MS), which bounds
+     * its own wait. */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (why && (strcmp(why, "parked") == 0 || strcmp(why, "sema-acquire") == 0 || strcmp(why, "flip-pace") == 0)) { stuck = 0; last = s_fifo_getoff; }
+      if (why && (strcmp(why, "parked") == 0 || strcmp(why, "sema-acquire") == 0 || strcmp(why, "flip-pace") == 0 || strcmp(why, "spu-hold") == 0)) { stuck = 0; last = s_fifo_getoff; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
