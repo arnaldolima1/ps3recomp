@@ -924,9 +924,14 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
             for (int k = 0; k < s_nea; k++)
                 if ((ctx->mfc_eal & ~127u) == s_mea[k] || ((ctx->mfc_eal + ctx->mfc_size - 1u) & ~127u) == s_mea[k]) hit_ea = 1;
             if (((s_mi >= 0 && ctx->image_id == s_mi) || hit_ea) && s_mn++ < s_mmax) {
-                const uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK, n = ctx->mfc_size < 64u ? ctx->mfc_size : 64u;
+                /* SPU_MFCLOG_BYTES=<n>: bytes of data per line (default 64,
+                 * at most 256) -- a job object's fields past +0x40 were cut. */
+                static int s_mb = -1;
+                if (s_mb < 0) { const char* e = getenv("SPU_MFCLOG_BYTES"); s_mb = e ? atoi(e) : 64;
+                                if (s_mb < 0) s_mb = 0; if (s_mb > 256) s_mb = 256; }
+                const uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK, n = ctx->mfc_size < (uint32_t)s_mb ? ctx->mfc_size : (uint32_t)s_mb;
                 extern int spu_workload_current_task(void);
-                char line[320]; int o = snprintf(line, sizeof line, "[mfclog] img=%d task=%d spu=%u cmd=%02X lsa=%05X ea=%08X size=%X tag=%u:",
+                char line[960]; int o = snprintf(line, sizeof line, "[mfclog] img=%d task=%d spu=%u cmd=%02X lsa=%05X ea=%08X size=%X tag=%u:",
                                                   ctx->image_id, spu_workload_current_task(), ctx->spu_id, v & 0xFFu, lsa, ctx->mfc_eal, ctx->mfc_size, ctx->mfc_tag);
                 for (uint32_t k = 0; k < n && lsa + k < SPU_LS_SIZE; k++)
                     o += snprintf(line + o, sizeof line - (size_t)o, (k & 3) ? "%02X" : " %02X", ctx->ls[lsa + k]);

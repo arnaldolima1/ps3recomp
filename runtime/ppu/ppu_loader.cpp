@@ -848,6 +848,17 @@ extern "C" void ppu_resv_register(ppu_context* c)
  * last DIRECT call site and nothing more. */
 extern "C" void ppu_report_guest_lrs(void)
 {
+    /* WATCHDOG_DUMP=<ea>,<len>: hex-dump guest memory at each sample, for the
+     * data a stuck thread is walking (its registers may be cached in host
+     * registers inside a tight loop, so the context alone can be stale). */
+    { const char* e = getenv("WATCHDOG_DUMP"); unsigned ea = 0, len = 0;
+      if (e && sscanf(e, "%x,%x", &ea, &len) == 2 && len && len <= 0x10000)
+          for (unsigned o = 0; o < len; o += 16) {
+              fprintf(stderr, "[WATCHDOG] mem %08X:", ea + o);
+              for (unsigned k = 0; k < 16; k += 4)
+                  fprintf(stderr, " %08X", __builtin_bswap32(*(uint32_t*)(vm_base + ea + o + k)));
+              fprintf(stderr, "\n");
+          } }
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
@@ -855,6 +866,15 @@ extern "C" void ppu_report_guest_lrs(void)
         fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+        /* WATCHDOG_REGS=1: every GPR too. A thread busy in an interpreter
+         * (a script VM) keeps the same lr while its state -- the bytecode
+         * pointer, the operand stack -- lives in registers. */
+        if (getenv("WATCHDOG_REGS"))
+            for (int r = 0; r < 32; r += 8)
+                fprintf(stderr, "[WATCHDOG]     r%-2d: %08X %08X %08X %08X %08X %08X %08X %08X\n", r,
+                        (uint32_t)c->gpr[r], (uint32_t)c->gpr[r + 1], (uint32_t)c->gpr[r + 2],
+                        (uint32_t)c->gpr[r + 3], (uint32_t)c->gpr[r + 4], (uint32_t)c->gpr[r + 5],
+                        (uint32_t)c->gpr[r + 6], (uint32_t)c->gpr[r + 7]);
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
          * targets. lr cannot see those (bctrl does not write it), so for a
          * thread looping on a vtable call the ring is the only record of where

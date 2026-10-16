@@ -657,6 +657,32 @@ static void dump_threads(const char* label, HMODULE self)
                     dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
                             (unsigned long)te.th32ThreadID, base ? base + 1 : path);
                 }
+                /* WATCHDOG_UNWIND=1: the exact frames, from the x64 unwind
+                 * data (.pdata) every PE carries even without a PDB, starting
+                 * from the full suspended context. The stack scan below guesses
+                 * at return addresses; this names the real chain, ntdll and
+                 * runtime frames included (module + RVA; resolve the exe's with
+                 * a /MAP link). */
+                if (getenv("WATCHDOG_UNWIND")) {
+                    CONTEXT uc; uc.ContextFlags = CONTEXT_FULL;
+                    if (GetThreadContext(th, &uc)) {
+                        for (int f = 0; f < 32 && uc.Rip; f++) {
+                            HMODULE um = NULL; char up[MAX_PATH] = "?";
+                            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               (LPCSTR)uc.Rip, &um);
+                            if (um) GetModuleFileNameA(um, up, sizeof up);
+                            const char* ub = strrchr(up, '\\');
+                            dbg_printf("[WATCHDOG]     unwind #%02d %s+0x%llX\n", f, ub ? ub + 1 : up,
+                                       (unsigned long long)(um ? uc.Rip - (DWORD64)um : uc.Rip));
+                            DWORD64 ib = 0;
+                            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(uc.Rip, &ib, NULL);
+                            if (!rf) { uc.Rip = *(DWORD64*)uc.Rsp; uc.Rsp += 8; continue; }
+                            PVOID hd = NULL; DWORD64 ef = 0;
+                            RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, uc.Rip, rf, &uc, &hd, &ef, NULL);
+                        }
+                    }
+                }
                 /* Scan the suspended thread's stack for boot-module return
                  * addresses to reconstruct the lifted call chain — done for ALL
                  * threads (even when RIP is parked in ntdll inside a CriticalSection
