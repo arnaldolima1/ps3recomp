@@ -3368,6 +3368,13 @@ static void eng_dump_frame(id<MTLTexture> src)
     }
     [src getBytes:rgba bytesPerRow:w * 4
       fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    /* A "%u" in the path takes the frame number, so a run keeps a sequence
+     * instead of overwriting one file. */
+    char numbered[1024];
+    if (strstr(path, "%u")) {
+        snprintf(numbered, sizeof numbered, path, frame);
+        path = numbered;
+    }
     FILE* f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%zu %zu\n255\n", w, h);

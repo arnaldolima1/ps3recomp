@@ -70,6 +70,9 @@ void     ps3_load_prx_modules(void) {}
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>   /* CFRunLoopRunInMode: main() serves AppKit */
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1241,6 +1244,31 @@ int main(int argc, char** argv)
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, stack_top);
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
+#endif
+#ifdef __APPLE__
+    /* AppKit only serves a window from the main thread's run loop, and the
+     * Metal backend reaches it with dispatch_sync onto the main queue (window
+     * creation, every event pump). With the guest running on the main thread
+     * nothing ever drained that queue: the vblank ticker blocked in its first
+     * pump and the title stopped at its first flip. Run the guest on a thread
+     * of its own, with a main-thread-sized stack, and keep the main thread in
+     * the run loop. */
+    {
+        static uint32_t s_entry, s_stack_top;
+        static volatile int s_rc = -1;
+        s_entry = entry; s_stack_top = stack_top;
+        struct GuestMain {
+            static DWORD WINAPI run(LPVOID) {
+                int rc = ppu_run(s_entry, s_stack_top);
+                printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
+                s_rc = g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
+                fflush(stdout); fflush(stderr);
+                exit(s_rc);
+            }
+        };
+        CreateThread(NULL, 64u * 1024 * 1024, GuestMain::run, NULL, 0, NULL);
+        for (;;) CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+    }
 #endif
     int rc = ppu_run(entry, stack_top);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
