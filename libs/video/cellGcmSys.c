@@ -1746,8 +1746,28 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* ...but not at once. A title may park the RSX while the
+                   * next segment is still being built and patch the park
+                   * afterwards: God of War: Ascension moves `put` to the end
+                   * of a frame its SPU jobs are still filling, then rewrites
+                   * the park into a JUMP to it. Following the write head at
+                   * once skipped the whole frame -- including the user
+                   * command that releases the frame slot the render thread
+                   * waits on -- so nothing was ever drawn. Give the patch
+                   * GCM_PARK_WAIT_MS (default 2000) before giving up. */
+                  if (put != s_fifo_getoff) {
+                      static u32 park_at = 0xFFFFFFFFu;
+                      static unsigned long long park_since = 0, park_wait = ~0ull;
+                      if (park_wait == ~0ull) { const char* e = getenv("GCM_PARK_WAIT_MS");
+                          park_wait = e ? strtoull(e, NULL, 0) : 2000ull; }
+                      const unsigned long long now = ps3_ms_now();
+                      if (park_at != s_fifo_getoff) { park_at = s_fifo_getoff; park_since = now; }
+                      else if (now - park_since >= park_wait) {
+                          park_at = 0xFFFFFFFFu;
+                          gcm_fifo_dump_around(s_fifo_getoff);
+                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                      }
+                  }
                   break;
               }
               s_fifo_getoff = tgt; }
