@@ -377,12 +377,22 @@ void spu_pcwatch(spu_context* ctx, uint32_t pc)
             e = (*end == ',') ? end + 1 : NULL; }
         s_pw_n = n; }
     for (int k = 0; k < s_pw_n; k++) if (pc == s_pw[k]) {
+        /* SPU_PCWATCH_MOD=<hex>: only while that job module (the word at LS
+         * 0x4000) is loaded; job modules share their LS addresses. */
+        static int s_pm_set = -1; static uint32_t s_pm;
+        if (s_pm_set < 0) { const char* e = getenv("SPU_PCWATCH_MOD");
+            s_pm_set = e ? 1 : 0; s_pm = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+        const uint32_t mod = ((uint32_t)ctx->ls[0x4000] << 24) | ((uint32_t)ctx->ls[0x4001] << 16)
+                           | ((uint32_t)ctx->ls[0x4002] << 8) | ctx->ls[0x4003];
+        if (s_pm_set && mod != s_pm) return;
         static long s_pw_lines = 0;
         if (s_pw_lines++ < 400)
-            fprintf(stderr, "[pcwatch] pc=0x%05X img=%d ls4000=%02X%02X%02X%02X r3=%08X r4=%08X r5=%08X r12=%08X r81=%08X\n",
-                    pc, ctx->image_id, ctx->ls[0x4000], ctx->ls[0x4001], ctx->ls[0x4002], ctx->ls[0x4003],
-                    ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0],
-                    ctx->gpr[12]._u32[0], ctx->gpr[81]._u32[0]);
+            fprintf(stderr, "[pcwatch] pc=0x%05X img=%d ls4000=%08X r3=%08X r4=%08X r5=%08X r6=%08X r12=%08X"
+                            " r80=%08X r81=%08X r82=%08X r83=%08X\n",
+                    pc, ctx->image_id, mod,
+                    ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0],
+                    ctx->gpr[12]._u32[0], ctx->gpr[80]._u32[0], ctx->gpr[81]._u32[0],
+                    ctx->gpr[82]._u32[0], ctx->gpr[83]._u32[0]);
         return;
     }
 }

@@ -342,6 +342,9 @@ void spu_mfc_release(spu_context* ctx)
 
 /* Exit safety net for contexts unwound off a departing thread's stack.
  * Pointer comparisons suffice: the abandoned context need not be readable. */
+/* The MFC tag groups that have completed, for diagnostics (SPURS_PM_RUNLOG). */
+uint32_t spu_mfc_tag_completed(spu_context* ctx) { return mfc_for(ctx)->tag_completed; }
+
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
 {
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
@@ -394,6 +397,30 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * itself; we have no manager, so we pass this and treat arriving here as job
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
+
+/* The last 16 MFC commands of this SPU thread (mfc_submit notes each), printed
+ * by SPU_LLAR0_TRAP: what the module fetched just before it went wrong. */
+static SPU_THREAD_LOCAL struct { uint32_t cmd, lsa, size, tag, pc, ls0; uint64_t ea; } t_dmaring[16];
+static SPU_THREAD_LOCAL unsigned t_dmaring_n;
+void spu_dmaring_note(const spu_context* ctx, uint32_t cmd, uint32_t lsa, uint64_t ea,
+                      uint32_t size, uint32_t tag)
+{
+    unsigned i = t_dmaring_n++ & 15u;
+    t_dmaring[i].cmd = cmd; t_dmaring[i].lsa = lsa; t_dmaring[i].ea = ea;
+    t_dmaring[i].size = size; t_dmaring[i].tag = tag;
+    t_dmaring[i].pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    t_dmaring[i].ls0 = 0;
+}
+void spu_dmaring_dump(void)
+{
+    unsigned n = t_dmaring_n < 16u ? t_dmaring_n : 16u;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned i = (t_dmaring_n - n + k) & 15u;
+        fprintf(stderr, "[llar0]   dma[-%u] cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u pc=0x%05X\n",
+                n - k, t_dmaring[i].cmd & 0xFFu, t_dmaring[i].lsa, (unsigned long long)t_dmaring[i].ea,
+                t_dmaring[i].size, t_dmaring[i].tag, t_dmaring[i].pc);
+    }
+}
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
@@ -499,6 +526,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                             "[atom-ea] cmd=0x%X img=%d pc=0x%05X lr=0x%05X ea=0x%08X",
                             cmd, ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                             ctx->gpr[0]._u32[0] & SPU_LS_MASK, (uint32_t)ea);
+              /* Under a policy module, which workload (wklCurrentId, LS 0x1DC)
+               * and SPU (spuNum, LS 0x1C8): one image serves many workloads. */
+              if (ctx->policy_mode)
+                  p += snprintf(buf + p, sizeof buf - p, " wid=%u spu=%u", ctx->ls[0x1DF], ctx->ls[0x1CB]);
               int nb = s_af == 2 ? 128 : s_af ? 64 : 8;   /* 64 covers +0x30 pendingRecv; =2 the whole line */
               p += snprintf(buf + p, sizeof buf - p, " RAM=");
               for (int i = 0; i < nb && p < (int)sizeof buf - 4; i++)
@@ -532,6 +563,46 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
+        /* SPU_LLAR0_TRAP=1: the first GETLLAR of EA 0 from each SPU, with every
+         * register's preferred word and the return addresses saved on the SPU
+         * stack. Nothing reserves EA 0; a module that does has computed its
+         * line from a field that was never filled. */
+        if (ea == 0) {
+            static int s_t = -1;
+            if (s_t < 0) s_t = getenv("SPU_LLAR0_TRAP") ? 1 : 0;
+            static SPU_THREAD_LOCAL int t_done;
+            if (s_t && !t_done) {
+                t_done = 1;
+                fprintf(stderr, "[llar0] img=%d spu%u pc=0x%05X lr=0x%05X lsa=0x%05X ls4000=%02X%02X%02X%02X\n",
+                        ctx->image_id, (unsigned)(ctx->spu_id & 7u), (unsigned)(ctx->pc & SPU_LS_MASK),
+                        ctx->gpr[0]._u32[0] & SPU_LS_MASK, lsa,
+                        ctx->ls[0x4000], ctx->ls[0x4001], ctx->ls[0x4002], ctx->ls[0x4003]);
+                for (int r = 0; r < 128; r += 8)
+                    fprintf(stderr, "[llar0]   r%-3d %08X %08X %08X %08X %08X %08X %08X %08X\n", r,
+                            ctx->gpr[r]._u32[0], ctx->gpr[r+1]._u32[0], ctx->gpr[r+2]._u32[0], ctx->gpr[r+3]._u32[0],
+                            ctx->gpr[r+4]._u32[0], ctx->gpr[r+5]._u32[0], ctx->gpr[r+6]._u32[0], ctx->gpr[r+7]._u32[0]);
+                { extern void spu_dmaring_dump(void); spu_dmaring_dump(); }
+                static const uint32_t s_ls_spans[][2] = { {0x80, 0x40}, {0x100, 0x80}, {0x1C0, 0x20} };
+                for (unsigned s = 0; s < sizeof s_ls_spans / sizeof s_ls_spans[0]; s++)
+                    for (uint32_t o = s_ls_spans[s][0]; o < s_ls_spans[s][0] + s_ls_spans[s][1]; o += 16) {
+                        const uint8_t* q = ctx->ls + o;
+                        fprintf(stderr, "[llar0]   LS %05X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", o,
+                                q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7], q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                    }
+                /* SPU ABI frames: the back chain at 0($sp), the caller's link
+                 * saved at 16 bytes into the caller's frame. */
+                uint32_t sp = ctx->gpr[1]._u32[0] & SPU_LS_MASK;
+                for (int d = 0; d < 12 && sp && sp < 0x40000u - 32; d++) {
+                    uint32_t back = __builtin_bswap32(*(const uint32_t*)(ctx->ls + sp));
+                    uint32_t link = back && back < 0x40000u - 32
+                                  ? __builtin_bswap32(*(const uint32_t*)(ctx->ls + back + 16)) : 0;
+                    fprintf(stderr, "[llar0]   frame sp=0x%05X back=0x%05X link=0x%05X\n", sp, back, link);
+                    if (back <= sp) break;
+                    sp = back;
+                }
+                fflush(stderr);
+            }
+        }
         spu_lockline_lock();
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing
@@ -2112,7 +2183,38 @@ void spu_indirect_branch(spu_context* ctx)
             if (n <= 4 || (n % 4096) == 0)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
-            ctx->gpr[3] = spu_make_preferred_u32(0);
+            /* The kernel's selection refreshes tempArea, here as on entry. */
+            { extern void spurs_kernel_temp_area_refresh(spu_context*);
+              spurs_kernel_temp_area_refresh(ctx); }
+            /* The kernel's answer is a u64 in the preferred doubleword: the
+             * workload it selected in the high word, the poll status in the
+             * low one (RPCS3, spursKernel1SelectWorkload). cellSpursModulePoll
+             * yields when the selected workload is not wklCurrentId, so "keep
+             * running" is the module's own id, read back from LS 0x1DC. This
+             * answer 0 -- workload 0 selected -- keeps wid 0 running but
+             * tells every other policy module to yield after one poll: God of
+             * War: Ascension's Wws job managers (wid 14-18) left each run after
+             * a single pipeline step, their last jobs unstored. */
+            { const uint8_t* k = ctx->ls + 0x1DC;
+              const uint32_t cur = ((uint32_t)k[0] << 24) | ((uint32_t)k[1] << 16)
+                                 | ((uint32_t)k[2] << 8) | k[3];
+              /* Under SPURS_READY_LEVEL the answer is a real selection
+               * (cellSpurs.c). Otherwise it stays 0, as it always was: a
+               * policy module that never yields would hold its host worker
+               * forever, and the scheduler's idle re-runs count on them
+               * leaving. */
+              extern int spurs_ready_level(void);
+              extern uint32_t spurs_poll_select(uint32_t ea, uint32_t cur, uint32_t spu);
+              uint32_t sel = 0;
+              if (spurs_ready_level()) {
+                  const uint8_t* q = ctx->ls + 0x1C4;   /* spurs EA, low word */
+                  const uint8_t* n = ctx->ls + 0x1C8;   /* spuNum */
+                  sel = spurs_poll_select(((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3],
+                                          cur, ((uint32_t)n[0] << 24) | ((uint32_t)n[1] << 16) | ((uint32_t)n[2] << 8) | n[3]);
+              }
+              ctx->gpr[3] = spu_make_preferred_u32(0);
+              ctx->gpr[3]._u32[0] = sel;     /* selected workload */
+              ctx->gpr[3]._u32[1] = 0; }     /* poll status: nothing pending */
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

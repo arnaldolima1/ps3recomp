@@ -1827,6 +1827,54 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     return 0;
 }
 
+/* SPURS_READY_LEVEL=1: readyCount is a level, as the real kernel treats it --
+ * a workload is selected while readyCount exceeds the SPUs it already holds,
+ * and selecting it does not consume the count; the policy module lowers it
+ * itself when it runs out of work. The default instead consumes one unit per
+ * admission, which paces a title that kicks once per job. God of War:
+ * Ascension's Wws job manager needs the level: it runs one pipeline step per
+ * entry and zeroes its own readyCount only once its jobs have been stored, so
+ * consuming the count left each frame's last jobs unstored -- and their
+ * dependency decrements undone -- until the next frame's kick, and the frame
+ * after that waited on them forever. */
+int spurs_ready_level(void)
+{
+    static int s_level = -1;
+    if (s_level < 0) { const char* e = getenv("SPURS_READY_LEVEL"); s_level = e && *e != '0'; }
+    return s_level;
+}
+
+/* The kernel's answer to cellSpursModulePoll under SPURS_READY_LEVEL: the
+ * workload SPU `spu` of the instance at `ea` should run now. The caller keeps
+ * the SPU while it is still eligible -- readyCount at least the SPUs it holds
+ * (this one included), or a signal; otherwise the first other workload that is
+ * enabled, runnable, has a priority on this SPU and wants an SPU it does not
+ * have; otherwise CELL_SPURS_SYS_SERVICE_WORKLOAD_ID (0x20), "nothing", on
+ * which a module yields. The Wws job manager zeroes its readyCount before it
+ * polls and restores it after, so this is how it learns whether to go on. */
+u32 spurs_poll_select(u32 ea, u32 cur, u32 spu)
+{
+    struct SpursInst* si = spurs_inst_find(ea);
+    if (!si || spu >= CELL_SPURS_MAX_SPU) return 0x20;
+    const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
+    const u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+    u32 pick = 0x20;
+    for (u32 w = 0; w < nwid; w++) {
+        if (!(enabled & (0x80000000u >> w)) || vm_read8(ea + wkl_state_off(w)) != 2 ||
+            !s_workloads[w].in_use || s_workloads[w].spurs_ea != ea ||
+            !vm_read8(ea + wkl_info_off(w) + 0x18 + spu))
+            continue;
+        const u32 ready = vm_read8(ea + wkl_ready_off(w));
+        const int sig = wkl_signalled(ea, w);
+        if (w == cur) {
+            if (sig || ready >= si->active[w]) return cur;
+        } else if (pick == 0x20 && (sig || ready > si->active[w])) {
+            pick = w;
+        }
+    }
+    return pick;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
@@ -1870,7 +1918,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 } }
               fflush(stderr);
           } }
-        for (u32 sn = 0; sn < si->nspus; sn++) {
+        /* Under SPURS_READY_LEVEL every SPU gets the first pick in turn, as
+         * each real SPU runs its own kernel. A Wws job manager keeps its
+         * pipeline in the local store of the SPU it ran on, so a job it left
+         * in the store phase completes only when that SPU selects it again;
+         * scanning from SPU 0 every pass sent its re-runs to the same one or
+         * two SPUs and stranded the others' stores. */
+        const u32 sn0 = spurs_ready_level() ? si->pass_no % si->nspus : 0;
+        for (u32 k = 0; k < si->nspus; k++) {
+            const u32 sn = (sn0 + k) % si->nspus;
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
             const u32 nwid = si->is2 ? SPURS_MAX_WID : 16u;
@@ -1888,7 +1944,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 WklPm* pm = spurs_resolve_pm(wid);
                 if (!pm) continue;
                 u32 ready = vm_read8(ea + wkl_ready_off(wid));
-                int kicked = ready || wkl_signalled(ea, wid);
+                int kicked = (spurs_ready_level() ? ready > si->active[wid] : ready != 0)
+                             || wkl_signalled(ea, wid);
                 /* SPURS_KICKLOG=<n>: every admission that has work waiting
                  * (ready count or signal), up to n lines. */
                 { static long s_kl = -2;
@@ -1905,7 +1962,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     continue;
                 spu_lockline_lock();
                 ready = vm_read8(ea + wkl_ready_off(wid));
-                if (ready) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
+                if (ready && !spurs_ready_level()) vm_base[ea + wkl_ready_off(wid)] = (u8)(ready - 1);
                 if (wkl_signalled(ea, wid)) wkl_signal_clear(ea, wid);
                 ef_line_end(ea);
                 slot->fn = pm->fn; slot->image_id = pm->image_id;

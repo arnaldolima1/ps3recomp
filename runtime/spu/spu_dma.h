@@ -929,6 +929,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int rc = 0;
+    /* The last commands this SPU issued, for SPU_LLAR0_TRAP (spu_channels.c). */
+    { extern void spu_dmaring_note(const spu_context*, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t);
+      spu_dmaring_note(spu, cmd, lsa, ea, size, tag); }
 
     /* SPU_WATCHEA=<hex guest addr>: report every DMA whose destination range
      * covers one word, with the SPU id, its pc and the value the word holds

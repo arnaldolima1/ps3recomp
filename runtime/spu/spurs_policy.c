@@ -33,6 +33,27 @@
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
+/* SpursKernelContext.tempArea (LS 0x100..0x17F) holds the first 128 bytes of
+ * the CellSpurs instance: the kernel copies them there each time it selects a
+ * workload, on entry and on every cellSpursModulePoll (RPCS3 does the same in
+ * spursKernel1/2SelectWorkload). Modules read instance fields from that copy
+ * rather than DMA them. God of War: Ascension's Wws barrier job module reads
+ * flags1 there (LS 0x174) before it looks a wid >= 16 up; with the area never
+ * filled, SF1_32_WORKLOADS read as clear whenever no guest DMA had happened to
+ * land there, the lookup took its error path and the job spun on a GETLLAR of
+ * EA 0 -- the frame's EDGE list never finished, nondeterministically. */
+void spurs_kernel_temp_area_refresh(spu_context* ctx)
+{
+    extern uint8_t* vm_base;
+    const uint8_t* k = ctx->ls + 0x1C4;   /* spurs EA, low word of the u64 */
+    const uint32_t ea = ((uint32_t)k[0] << 24) | ((uint32_t)k[1] << 16)
+                      | ((uint32_t)k[2] << 8) | k[3];
+    if (!vm_base || !ea || ea > 0xFFFFFF80u) return;
+    spu_lockline_lock();                  /* one snapshot, as the kernel's DMA is */
+    memcpy(ctx->ls + 0x100, vm_base + ea, 0x80);
+    spu_lockline_unlock();
+}
+
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (per worker, including the exit classification used by the caller). */
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
@@ -265,6 +286,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
     KBE32(0x1E4, SPURS_PM_SELECT_WORKLOAD_LS);
 #undef KBE32
+    spurs_kernel_temp_area_refresh(ctx);
 
     /* Entry registers per cellSpursModuleEntry. */
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;  /* return-to-kernel link */
@@ -530,6 +552,28 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                 wid, ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
         fflush(stderr);
     }
+    /* SPURS_PM_RUNLOG=<wid>: one line per run of that workload, with how it
+     * ended and the job manager's state words (Wws: loadJobState at LS 0x12A0,
+     * the job slots from 0x12C0), so a job left mid-pipeline between runs
+     * shows. SPURS_PM_RUNLOG_MAX caps the lines (default 2000). */
+    { static int s_rl = -2; static long s_rl_max;
+      if (s_rl == -2) { const char* e = getenv("SPURS_PM_RUNLOG"); s_rl = e ? atoi(e) : -1;
+                        const char* m = getenv("SPURS_PM_RUNLOG_MAX"); s_rl_max = m ? atol(m) : 2000; }
+      if (s_rl >= 0 && (uint32_t)s_rl == wid) {
+          extern uint32_t spu_mfc_tag_completed(spu_context*);
+          static long s_rl_n;
+          if (s_rl_n++ < s_rl_max) {
+              const uint8_t* L = ctx->ls;
+              #define RW(o) (((uint32_t)L[(o)] << 24) | ((uint32_t)L[(o)+1] << 16) | ((uint32_t)L[(o)+2] << 8) | L[(o)+3])
+              fprintf(stderr, "[pm-run] t=%llu wid=%u spu=%u first=%d polls=%u exited=%u status=0x%X pc=0x%05X"
+                              " tags=0x%08X parked=0x%X 12A0=%08X %08X %08X %08X 12C0=%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                      (unsigned long long)GetTickCount64(), wid, spu_num, first, g_spurs_pm_polls, g_spurs_pm_exited,
+                      ctx->status, ctx->pc & SPU_LS_MASK, spu_mfc_tag_completed(ctx), ctx->list_stall_mask,
+                      RW(0x12A0), RW(0x12A4), RW(0x12A8), RW(0x12AC),
+                      RW(0x12C0), RW(0x12C4), RW(0x12C8), RW(0x12CC), RW(0x12D0), RW(0x12D4), RW(0x12D8), RW(0x12DC));
+              #undef RW
+          }
+      } }
 
     int result = g_spurs_pm_exited ? 0 : -2;
     policy_slot_release(resident);
@@ -647,6 +691,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
     /* taskset EA also planted at the SpursKernelContext taskset slot the policy
      * reads for its taskset DMA (mirrors the cri-r4 injection at LS 0x27B8). */
 #undef KBE32
+    spurs_kernel_temp_area_refresh(ctx);
 
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;
     ctx->gpr[1]._u32[0] = 0x3FFB0;
