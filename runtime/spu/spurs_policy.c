@@ -43,14 +43,15 @@ SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0
  * from different instances must never share local store or pipeline state.
  * Each slot lock also serializes direct callers of this existing API. */
 #define SPURS_PM_INSTANCES 4
+#define SPURS_PM_MAX_WKL 32   /* CellSpurs2: 32 workloads */
 struct PmInstance;
 struct PmSlot { SRWLOCK lock; spu_context* ctx; uint64_t data; struct PmInstance* owner;
     const uint8_t* pm; uint32_t size, wid; spu_lifted_entry_fn entry; int image_id; };
 static struct PmInstance {
     int used, retiring;
-    unsigned users, workload_users[16];
+    unsigned users, workload_users[SPURS_PM_MAX_WKL];
     uint32_t ea;
-    struct PmSlot slots[16][6];
+    struct PmSlot slots[SPURS_PM_MAX_WKL][6];
 } s_pm_instances[SPURS_PM_INSTANCES];
 static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_pm_directory_wake;
@@ -97,7 +98,7 @@ static void policy_slot_release(struct PmSlot* slot)
  * a direct caller that still owns a reference makes removal BUSY instead. */
 int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
 {
-    if (wid >= 16) return -1;
+    if (wid >= SPURS_PM_MAX_WKL) return -1;
     AcquireSRWLockExclusive(&s_pm_directory_lock);
     for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
         struct PmInstance* pi = &s_pm_instances[i];
@@ -133,7 +134,7 @@ void spurs_policy_release_instance(uint32_t ea)
         pi->retiring = 1;
         while (pi->users)
             SleepConditionVariableSRW(&s_pm_directory_wake, &s_pm_directory_lock, INFINITE, 0);
-        for (unsigned w = 0; w < 16; w++) for (unsigned n = 0; n < 6; n++) {
+        for (unsigned w = 0; w < SPURS_PM_MAX_WKL; w++) for (unsigned n = 0; n < 6; n++) {
             struct PmSlot* slot = &pi->slots[w][n];
             AcquireSRWLockExclusive(&slot->lock);
             if (slot->ctx) {
@@ -171,7 +172,6 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * never progress its claim/stage pipeline). Image + context init happen
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     struct PmSlot* resident = policy_slot(spurs_ea, wid, spu_num);
     if (!resident) return -1;
@@ -428,8 +428,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         /* PER-WID cap: a shared cap gets exhausted by idle wid=0/1 before the
          * jobmanager (wid=12) ever runs in a long/good run. Give each wid its
          * own budget so wid=12's pipeline is always captured. */
-        static SPU_THREAD_LOCAL unsigned long s_pn_wid[16] = {0};
-        unsigned long s_pn = ++s_pn_wid[wid & 15];
+        static SPU_THREAD_LOCAL unsigned long s_pn_wid[SPURS_PM_MAX_WKL] = {0};
+        unsigned long s_pn = ++s_pn_wid[wid % SPURS_PM_MAX_WKL];
         if (s_pn < 300) {
             const uint8_t* L = ctx->ls;
             #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])

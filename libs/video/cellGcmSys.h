@@ -314,7 +314,6 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset);
 
 /* NID: 0x5A41C10F */
 s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size);
-s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags);
 
 /* NID: 0x626E8518 */
 s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags);
