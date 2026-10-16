@@ -497,6 +497,16 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
 }
 
+/* The second-generation entry point (a CellSpurs2 instance, the same
+ * attribute). God of War: Ascension (BCES01741) initialises its SPURS with
+ * it; the instance is set up as the first-generation one is. */
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr)
+{
+    printf("[cellSpurs] InitializeWithAttribute2 -> InitializeWithAttribute\n");
+    return cellSpursInitializeWithAttribute(spurs, attr);
+}
+
 static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
 
 s32 cellSpursFinalize(CellSpurs* spurs)
@@ -588,6 +598,19 @@ s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr)
 {
     if (!attr) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    return CELL_OK;
+}
+
+/* (attr, priority[8], maxSpu, isPreemptible[8]): reserve SPUs for the system
+ * workload. There is no system workload here, so like the other attribute
+ * switches it is accepted and changes nothing. */
+s32 cellSpursAttributeEnableSystemWorkload(CellSpursAttribute* attr,
+                                           const u8* priority, u32 maxSpu,
+                                           const u8* isPreemptible)
+{
+    (void)priority; (void)maxSpu; (void)isPreemptible;
+    if (!attr) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    printf("[cellSpurs] AttributeEnableSystemWorkload(maxSpu=%u)\n", maxSpu);
     return CELL_OK;
 }
 
@@ -791,6 +814,22 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
 {
     (void)attr;
     return cellSpursCreateTaskset(spurs, taskset, 0, NULL, 0);
+}
+
+/* (spurs, taskset2, attr2): the second-generation taskset, made as the first
+ * is, with the taskset argument the attribute carries (+0x08, big-endian, see
+ * _cellSpursTasksetAttribute2Initialize). God of War: Ascension (BCES01741)
+ * makes three right after its SPURS. */
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset,
+                            const void* attr)
+{
+    u64 args = 0;
+    if (attr) {
+        const u8* a = GUEST_PTR(attr, const u8*);
+        for (int i = 0; i < 8; i++) args = (args << 8) | a[0x08 + i];
+    }
+    printf("[cellSpurs] CreateTaskset2 -> CreateTaskset (arg=0x%016llX)\n", (unsigned long long)args);
+    return cellSpursCreateTaskset(spurs, taskset, args, NULL, 0);
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -1148,6 +1187,25 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = revision ? revision : 1;
     printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
+    return CELL_OK;
+}
+
+/* (attr, revision): the second-generation taskset attribute, 128 bytes.
+ * Big-endian fields, as the SDK lays them out: revision (+0x00), the name
+ * pointer (+0x04), the taskset argument (+0x08, 64-bit), eight priorities
+ * (+0x10), maxContention (+0x18), enableClearLs (+0x1C), the task-name
+ * buffer pointer (+0x20). Defaults: priorities 1, maxContention 8, the
+ * rest zero. Taskset creation does not read it back yet. */
+s32 _cellSpursTasksetAttribute2Initialize(void* attr, u32 revision)
+{
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    u8* a = GUEST_PTR(attr, u8*);
+    memset(a, 0, 128);
+    a[0] = (u8)(revision >> 24); a[1] = (u8)(revision >> 16);
+    a[2] = (u8)(revision >> 8);  a[3] = (u8)revision;
+    for (int i = 0; i < 8; i++) a[0x10 + i] = 1;
+    a[0x1B] = 8;
+    printf("[cellSpurs] _TasksetAttribute2Initialize(rev=%u)\n", revision);
     return CELL_OK;
 }
 
