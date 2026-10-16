@@ -96,7 +96,10 @@ const uint16_t DIST_BASE[30] = {
 const uint8_t DIST_EXTRA[30] = {
     0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
 
-/* One compressed block into `out`; returns bytes written or -1. */
+/* One compressed block into `out`; returns bytes written, -1 on a corrupt
+ * stream, or FULL once `out` holds `cap` bytes and the block wants more. */
+const int FULL = -2;
+
 int inflate_block(Bits& b, uint8_t* out, uint32_t cap, uint32_t written,
                   const Huff* lit, const Huff* dist)
 {
@@ -104,7 +107,7 @@ int inflate_block(Bits& b, uint8_t* out, uint32_t cap, uint32_t written,
         const int sym = huff_decode(b, lit);
         if (sym < 0 || b.bad) return -1;
         if (sym < 256) {
-            if (written >= cap) return -1;
+            if (written >= cap) return FULL;
             out[written++] = (uint8_t)sym;
         } else if (sym == 256) {
             return (int)written;
@@ -115,9 +118,11 @@ int inflate_block(Bits& b, uint8_t* out, uint32_t cap, uint32_t written,
             const int ds = huff_decode(b, dist);
             if (ds < 0 || ds >= 30) return -1;
             const uint32_t d = DIST_BASE[ds] + b.bits(DIST_EXTRA[ds]);
-            if (d > written || written + length > cap) return -1;
-            for (uint32_t i = 0; i < length; i++, written++)
+            if (d > written) return -1;
+            for (uint32_t i = 0; i < length; i++, written++) {
+                if (written >= cap) return FULL;
                 out[written] = out[written - d];
+            }
         }
     }
 }
@@ -125,7 +130,12 @@ int inflate_block(Bits& b, uint8_t* out, uint32_t cap, uint32_t written,
 }  // namespace
 
 /* Inflate a raw DEFLATE or zlib stream. Returns bytes written, or -1.
- * A leading 0x78 (CMF with CM=8) is treated as a zlib wrapper and skipped. */
+ * A leading 0x78 (CMF with CM=8) is treated as a zlib wrapper and skipped.
+ *
+ * A stream that decodes to more than `out_cap` bytes is not an error: the
+ * first `out_cap` bytes are produced and `out_cap` returned, as the SPU
+ * decompressor does. God of War: Ascension reads 64 bytes of a compressed
+ * asset to look at its header, and an error there was retried forever. */
 extern "C" int edge_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, uint32_t src_len)
 {
     if (!out || !src || src_len < 1) return -1;
@@ -147,7 +157,11 @@ extern "C" int edge_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, 
             if (b.pos + 4 > b.len) return -1;
             const uint32_t n = (uint32_t)src[b.pos] | ((uint32_t)src[b.pos + 1] << 8);
             b.pos += 4;
-            if (b.pos + n > b.len || written + n > out_cap) return -1;
+            if (b.pos + n > b.len) return -1;
+            if (written + n > out_cap) {
+                memcpy(out + written, src + b.pos, out_cap - written);
+                return (int)out_cap;
+            }
             memcpy(out + written, src + b.pos, n);
             b.pos += n;
             written += n;
@@ -199,6 +213,7 @@ extern "C" int edge_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, 
                 huff_build(&dist, lengths + hlit, hdist);
             }
             const int n = inflate_block(b, out, out_cap, written, &lit, &dist);
+            if (n == FULL) return (int)out_cap;
             if (n < 0) return -1;
             written = (uint32_t)n;
         } else {
