@@ -211,6 +211,14 @@ s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
 s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
                                             s32 type);
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr);
+s32 cellSpursAttributeEnableSystemWorkload(CellSpursAttribute* attr,
+                                           const u8* priority, u32 maxSpu,
+                                           const u8* isPreemptible);
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
+s32 _cellSpursTasksetAttribute2Initialize(void* attr, u32 revision);
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset,
+                            const void* attr);
 
 s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads);
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
