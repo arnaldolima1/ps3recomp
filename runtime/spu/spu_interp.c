@@ -345,6 +345,28 @@ static int spu_step(spu_context* ctx) {
 }
 
 uint32_t g_spu_interp_last_pc = 0;
+
+/* SPU_PCWATCH=<hex>,<hex>,... : log when interpreted or microstepped code
+ * reaches one of these LS addresses (runtime-loaded job code has no lifted
+ * symbol to break on), with the first word at LS 0x4000 to tell job modules
+ * apart. */
+void spu_pcwatch(spu_context* ctx, uint32_t pc)
+{
+    static int s_pw_n = -1; static uint32_t s_pw[8];
+    if (s_pw_n < 0) { int n = 0; const char* e = getenv("SPU_PCWATCH");
+        while (e && *e && n < 8) { char* end; s_pw[n++] = (uint32_t)strtoul(e, &end, 16);
+            e = (*end == ',') ? end + 1 : NULL; }
+        s_pw_n = n; }
+    for (int k = 0; k < s_pw_n; k++) if (pc == s_pw[k]) {
+        static long s_pw_lines = 0;
+        if (s_pw_lines++ < 400)
+            fprintf(stderr, "[pcwatch] pc=0x%05X img=%d ls4000=%02X%02X%02X%02X r3=%08X r4=%08X r5=%08X r12=%08X r81=%08X\n",
+                    pc, ctx->image_id, ctx->ls[0x4000], ctx->ls[0x4001], ctx->ls[0x4002], ctx->ls[0x4003],
+                    ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0],
+                    ctx->gpr[12]._u32[0], ctx->gpr[81]._u32[0]);
+        return;
+    }
+}
 uint64_t g_spu_interp_steps   = 0;
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
@@ -409,6 +431,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
+        spu_pcwatch(ctx, ctx->pc);
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
             if (inr) { _g1in = 1; }

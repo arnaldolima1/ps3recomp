@@ -1711,6 +1711,37 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
 
+        /* SPURS_WLDUMP=<seconds>: every so often, the first 0x100 bytes of
+         * each workload's data (for a Wws workload, its job list header and
+         * the per-SPU progress rows), to compare a list that completes with
+         * one that stalls. */
+        { static long s_wd = -2; static unsigned long long s_next = 0;
+          if (s_wd == -2) { const char* e = getenv("SPURS_WLDUMP"); s_wd = e ? atol(e) : -1; }
+          const unsigned long long now = GetTickCount64();
+          if (s_wd > 0 && now >= s_next) {
+              s_next = now + (unsigned long long)s_wd * 1000ull;
+              for (u32 w = 0; w < (si->is2 ? SPURS_MAX_WID : 16u); w++) {
+                  if (!s_workloads[w].in_use || s_workloads[w].spurs_ea != ea) continue;
+                  const u32 d = (u32)vm_read64(ea + wkl_info_off(w) + 8);
+                  if (!d || d >= 0xF0000000u) continue;
+                  fprintf(stderr, "[wl-dump] t=%llu wid=%u data=0x%08X\n", now, w, d);
+                  for (u32 o = 0; o < 0x100; o += 16)
+                      fprintf(stderr, "[wl-dump]   +%03X %08X %08X %08X %08X\n", o,
+                              vm_read32(d + o), vm_read32(d + o + 4), vm_read32(d + o + 8), vm_read32(d + o + 12));
+              }
+              /* SPURS_WLDUMP_EA=<hex>,<hex>,...: extra EAs dumped alongside. */
+              { const char* e = getenv("SPURS_WLDUMP_EA");
+                while (e && *e) {
+                    char* end; const u32 d = (u32)strtoul(e, &end, 16);
+                    fprintf(stderr, "[wl-dump] t=%llu ea=0x%08X\n", now, d);
+                    for (u32 o = 0; o < 0x80; o += 16)
+                        fprintf(stderr, "[wl-dump]   +%03X %08X %08X %08X %08X\n", o,
+                                vm_read32(d + o), vm_read32(d + o + 4), vm_read32(d + o + 8), vm_read32(d + o + 12));
+                    e = (*end == ',') ? end + 1 : NULL;
+                } }
+              fflush(stderr);
+          } }
+
         /* Kick visibility (can't-miss): log ANY nonzero readyCount/signal state
          * even for wids the dispatch filter below would skip — the game pokes
          * these bytes with inlined atomics and this is our only tap. */
@@ -1756,6 +1787,17 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             volatile u8* rdy = vm_base + ea + wkl_ready_off(wid);
             const int sg = wkl_signalled(ea, wid);
             int kicked = (*rdy != 0) || sg;
+            /* SPURS_KICKLOG=<n>: every dispatch that has work waiting (ready
+             * count or signal), uncapped up to n lines -- the POKE log above
+             * stops after four per workload. */
+            { static long s_kl = -2;
+              if (s_kl == -2) { const char* e = getenv("SPURS_KICKLOG"); s_kl = e ? atol(e) : -1; }
+              if (s_kl > 0 && kicked) {
+                  s_kl--;
+                  fprintf(stderr, "[spurs-kick] t=%llu wid=%u ready=%u sig=%d data=0x%llX\n",
+                          (unsigned long long)GetTickCount64(), wid, (unsigned)*rdy, sg,
+                          (unsigned long long)vm_read64(ea + wkl_info_off(wid) + 8));
+              } }
             if (*rdy) (*rdy)--;
             if (sg) wkl_signal_clear(ea, wid);
 
