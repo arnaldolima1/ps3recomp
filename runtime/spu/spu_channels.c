@@ -1969,7 +1969,10 @@ static int spu_smc_microstep(spu_context* ctx)
             pc += 4; continue;
         }
         if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
-            uint32_t a = (((w >> 7) & 0xFFFF) << 4) & SPU_LS_MASK & ~15u;
+            /* LSA = I16 || 0b00, as the lifter has it. This was I16 << 4, so
+             * the WWS interrupt handler's `lqa $77, 0xA40` read its stub
+             * template from 0x2900 and built garbage at 0x3FEC0. */
+            uint32_t a = ((uint32_t)i16 << 2) & SPU_LS_MASK & ~15u;
             if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[rt]);
             else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
@@ -2041,7 +2044,16 @@ static int spu_smc_microstep(spu_context* ctx)
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+        if (!spu_interp_run_until(ctx, pc, ctx->drain_ret_pc)) return 0;
+        /* Rejoined lifted code (or the drain's return point) still running:
+         * dispatch there, as the branch cases above do. Returning without a
+         * trampoline ended the whole run at that pc -- the WWS interrupt
+         * handler (God of War: Ascension) interprets its stub-building loop,
+         * rejoins at the lifted loop head and the policy module simply quit,
+         * so a list stall was never acknowledged and no job ever ran. */
+        if (!(ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)))
+            g_spu_trampoline_fn = spu_indirect_branch;
+        return 1;
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",

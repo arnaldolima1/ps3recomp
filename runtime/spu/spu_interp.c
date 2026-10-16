@@ -143,7 +143,10 @@ static int spu_step(spu_context* ctx) {
     case SPU_sfx:  DST = spu_sfx(A,B,DST); break;
     case SPU_cg:   DST = spu_cg(A,B); break;
     case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
+    case SPU_bgx:  DST = spu_bgx(A,B,DST); break;
     case SPU_mpyi: DST = spu_mpyi(A,I); break;
+    case SPU_mpyui: DST = spu_mpyui(A,I); break;
+    case SPU_mpyhhau: DST = spu_mpyhhau(A,B,T); break;   /* accumulates into rt */
     /* logical */
     case SPU_and: DST = spu_and(A,B); break;
     case SPU_or:  DST = spu_or(A,B); break;
@@ -187,6 +190,12 @@ static int spu_step(spu_context* ctx) {
     case SPU_rotmi:DST = spu_rotmi(A,I); break;
     case SPU_rotma:DST = spu_rotma(A,B); break;
     case SPU_rotmai:DST = spu_rotmai(A,I); break;
+    case SPU_rotmahi:DST = spu_rotmahi(A,I); break;
+    case SPU_rothmi: DST = spu_rothmi(A,I); break;
+    case SPU_rotmah: { u128 r, a = A, b = B;   /* halfword shift right algebraic by (-rb)&0x1F */
+        for (int k = 0; k < 8; k++) { uint32_t sh = (0u - b._u16[k]) & 0x1F;
+            r._s16[k] = sh > 15 ? (int16_t)(a._s16[k] >> 15) : (int16_t)(a._s16[k] >> sh); }
+        DST = r; break; }
     case SPU_roth: DST = spu_roth(A,B); break;
     case SPU_rothi:DST = spu_rothi(A,I); break;
     case SPU_shlqbi: DST = spu_shlqbi(A,B); break;
@@ -248,6 +257,19 @@ static int spu_step(spu_context* ctx) {
     case SPU_fma:  DSTC = spu_fma(A,B,T); break;    /* RRR: dest=rc */
     case SPU_fms:  DSTC = spu_fms(A,B,T); break;
     case SPU_fnms: DSTC = spu_fnms(A,B,T); break;
+    /* double: RR forms, the multiply-adds accumulate into rt */
+    case SPU_dfa:    DST = spu_dfa(A,B); break;
+    case SPU_dfs:    DST = spu_dfs(A,B); break;
+    case SPU_dfm:    DST = spu_dfm(A,B); break;
+    case SPU_dfma:   DST = spu_dfma(A,B,T); break;
+    case SPU_dfms:   DST = spu_dfms(A,B,T); break;
+    case SPU_dfnms:  DST = spu_dfnms(A,B,T); break;
+    case SPU_dfnma:  DST = spu_dfnma(A,B,T); break;
+    case SPU_dfceq:  DST = spu_dfceq(A,B); break;
+    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
+    case SPU_dfcgt:  DST = spu_dfcgt(A,B); break;
+    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
+    case SPU_dftsv:  DST = spu_dftsv(A,I); break;
     /* immediate byte/halfword compares */
     case SPU_ceqbi: DST = spu_ceqbi(A,I); break;
     case SPU_cgtbi: DST = spu_cgtbi(A,I); break;
@@ -290,6 +312,11 @@ static int spu_step(spu_context* ctx) {
     case SPU_bi:   next = PREF(A) & 0x3FFFC; break;
     case SPU_bisl: DST = spu_link(pc + 4); next = PREF(A) & 0x3FFFC; break;
     case SPU_iret: next = ctx->srr0 & 0x3FFFC; break;
+    case SPU_bisled: {   /* branch (and link) only while an enabled event is pending */
+        uint32_t tgt = PREF(A) & 0x3FFFC;
+        DST = spu_link(pc + 4);
+        if (ctx->event_status & ctx->event_mask) next = tgt;
+        break; }
     case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
