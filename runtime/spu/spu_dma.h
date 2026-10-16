@@ -795,6 +795,8 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
             spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+            { extern void spu_evlog(const spu_context*, const char*, uint32_t, uint32_t);
+              spu_evlog(spu, "SN-raise tag/ea", t, (uint32_t)ea_base); }
             /* Real MFC runs a queued list asynchronously, so the notify lands
              * AFTER the arming code finishes. We run it inline here, so hold the
              * resulting interrupt off for a few drain ticks -- otherwise the WWS

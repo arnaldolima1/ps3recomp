@@ -311,6 +311,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
+    { extern void spu_evlog(const spu_context*, const char*, uint32_t, uint32_t);
+      spu_evlog(ctx, "RUN-begin first", (uint32_t)first, 0); }
 
     /* RUN/END tracing: thousands of policy dispatches per second made these
      * unconditional fprintf+fflush pairs a real fraction of movie playback.
@@ -575,6 +577,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
           }
       } }
 
+    { extern void spu_evlog(const spu_context*, const char*, uint32_t, uint32_t);
+      spu_evlog(ctx, "RUN-end polls/exited", g_spurs_pm_polls, g_spurs_pm_exited); }
     int result = g_spurs_pm_exited ? 0 : -2;
     policy_slot_release(resident);
     return result;

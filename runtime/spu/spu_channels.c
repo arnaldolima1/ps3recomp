@@ -422,6 +422,24 @@ void spu_dmaring_dump(void)
     }
 }
 
+/* SPU_EVLOG=1 [SPU_EVLOG_WID=<wid>]: the interrupt path of a policy module
+ * in order -- stall-notify raised, interrupt taken, stall acknowledged, run
+ * begun and ended -- for one workload (wklCurrentId, LS 0x1DC) or all. */
+void spu_evlog(const spu_context* ctx, const char* what, uint32_t a, uint32_t b)
+{
+    static int s_on = -1; static int s_wid = -1;
+    if (s_on < 0) { s_on = getenv("SPU_EVLOG") ? 1 : 0;
+                    const char* w = getenv("SPU_EVLOG_WID"); s_wid = w ? atoi(w) : -1; }
+    if (!s_on || !ctx->policy_mode) return;
+    const unsigned wid = ctx->ls[0x1DF];
+    if (s_wid >= 0 && wid != (unsigned)s_wid) return;
+    static volatile LONG n;
+    if (InterlockedIncrement(&n) > 20000) return;
+    fprintf(stderr, "[evlog] t=%llu wid=%u spu=%u pc=0x%05X %s 0x%X 0x%X evmask=0x%X evstat=0x%X ie=%u parked=0x%X\n",
+            (unsigned long long)GetTickCount64(), wid, ctx->ls[0x1CB], (unsigned)(ctx->pc & SPU_LS_MASK),
+            what, a, b, ctx->event_mask, ctx->event_status, ctx->int_enable, ctx->list_stall_mask);
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -876,6 +894,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
             return;
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+        /* SPU_EVLOG=1: MFC_WrTagMask / MFC_WrTagUpdate writes under a policy
+         * module, with the event mask they meet (first 400). */
+        if (channel == MFC_WrTagUpdate || channel == MFC_WrTagMask || channel == MFC_WrListStallAck)
+            spu_evlog(ctx, channel == MFC_WrTagUpdate ? "TagUpdate" : channel == MFC_WrTagMask ? "TagMask" : "StallAck", v, 0);
         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
          * DMA completes synchronously, so the instant the program arms tag
          * notification (MFC_WrTagUpdate with a non-zero mode = any/all), the
@@ -931,7 +953,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         break;
     case SPU_WrDec:          ctx->decrementer = v;
                              ctx->dec_base_ns = spu_host_ns();              break;
-    case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
+    case SPU_WrEventMask:
+        spu_evlog(ctx, "EventMask", v, 0);
+                             ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
         /* Under the lock-line lock, because every producer of the LR bit sets
          * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
