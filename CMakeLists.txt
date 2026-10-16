@@ -36,6 +36,7 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/spurs/*.c"
     "libs/sync/*.c"
     "libs/codec/*.c"
+    "libs/codec/edge_inflate.cpp"   # RFC 1951 inflater for Edge Zlib requests done on the host
     "libs/font/*.c"
     "libs/misc/*.c"
     "libs/hardware/*.c"

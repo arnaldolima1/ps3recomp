@@ -2689,6 +2689,18 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     return CELL_OK;
 }
 
+s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size);
+
+/* (ea, io, size, flags): the mapping with the page flags the RSX takes;
+ * there is one address space here, so the flags change nothing. God of War:
+ * Ascension maps its IO range this way and, unregistered, saw garbage
+ * ("iooffset == -1"). */
+s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
+{
+    printf("[cellGcmSys] MapEaIoAddressWithFlags(flags=0x%X) -> MapEaIoAddress\n", flags);
+    return cellGcmMapEaIoAddress(ea, io, size);
+}
+
 /* NID: 0x5A41C10F */
 s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
 {

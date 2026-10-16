@@ -1148,6 +1148,38 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
 /* Create a task from a pre-initialized attribute (carries ELF EA + context).
  * Forwards to cellSpursCreateTask, which translates taskset/taskId and runs the
  * SPU image through spu_workload_dispatch. */
+/* (attr, revision): the second-generation task attribute, big-endian:
+ * revision (+0x00), sizeContext (+0x04), eaContext (+0x08, 64-bit), the
+ * 16-byte lsPattern (+0x10), the name pointer (+0x20). Only those 0x24 bytes
+ * are written: the attribute usually sits on the caller's stack, and its full
+ * size is not established here. God of War: Ascension calls it. */
+s32 _cellSpursTaskAttribute2Initialize(void* attr, u32 revision)
+{
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    const uint32_t a = (uint32_t)(uintptr_t)attr;
+    vm_write32(a + 0x00, revision);
+    for (uint32_t o = 0x04; o < 0x24; o += 4) vm_write32(a + o, 0);
+    printf("[cellSpurs] _TaskAttribute2Initialize(attr=0x%08X rev=%u)\n", a, revision);
+    return CELL_OK;
+}
+
+/* (taskset2, *id, elf, argument, attr2): made as cellSpursCreateTask makes a
+ * task, with the context and lsPattern the second-generation attribute
+ * carries (see _cellSpursTaskAttribute2Initialize), none without one. */
+s32 cellSpursCreateTask2(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                         void* elf, u32 argument_ea, u32 attr_ea)
+{
+    u32 size = 0, ctx = 0, ls = 0;
+    if (attr_ea) {
+        size = vm_read32(attr_ea + 0x04);
+        ctx  = vm_read32(attr_ea + 0x0C);   /* low word of the 64-bit eaContext */
+        ls   = attr_ea + 0x10;
+    }
+    printf("[cellSpurs] CreateTask2 elf=0x%08X arg=0x%08X ctx=0x%08X size=0x%X\n",
+           (u32)(uintptr_t)elf, argument_ea, ctx, size);
+    return cellSpursCreateTask(taskset, taskId, elf, (void*)(uintptr_t)ctx, size, ls, argument_ea);
+}
+
 s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
                                      CellSpursTaskId* taskId,
                                      CellSpursTaskAttribute* attr)
@@ -3325,6 +3357,36 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
     uint32_t q = (uint32_t)queue_ea;
     for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
 
+    /* PS3_LFQUEUE_SDK_LAYOUT=1: the SDK's CellSyncLFQueue line, as God of War:
+     * Ascension's libsync reads it (its SPU pop path compares the direction at
+     * +0x24 with 3 and works on push2 at +0x30 and pop2 at +0x50): pop1 and
+     * push1 (+0x00, +0x08) zero, size, depth, buffer, m_bs[4] (+0x20),
+     * direction (+0x24), m_v1 (+0x28), push2 (+0x30), pop2 (+0x50), eaSignal
+     * (+0x70). For ANY2ANY m_bs[0..1], m_v1, push2 and pop2 start all ones.
+     * Off by default: the ring layout below was derived from another title's
+     * consumer, and that title has not been checked with this one. */
+    { static int s_sdk = -1;
+      if (s_sdk < 0) s_sdk = getenv("PS3_LFQUEUE_SDK_LAYOUT") ? 1 : 0;
+      if (s_sdk) {
+          vm_write32(q + 0x10, size);
+          vm_write32(q + 0x14, depth);
+          vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);
+          vm_write32(q + 0x24, direction);
+          if (direction == 3) {
+              vm_write8(q + 0x20, 0xFF); vm_write8(q + 0x21, 0xFF);
+              vm_write32(q + 0x28, 0xFFFFFFFFu);
+              vm_write16(q + 0x30, 0xFFFF);
+              vm_write16(q + 0x50, 0xFFFF);
+          } else {
+              for (int i = 0; i < 4; i++) vm_write8(q + 0x20 + i, 0xFF);
+          }
+          vm_write64(q + 0x70, (u64)(uint32_t)owner_ea);
+          memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
+          printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> SDK layout\n",
+                 (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
+          return CELL_OK;
+      } }
+
     /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
      * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
      * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
@@ -3371,6 +3433,44 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
     static int _n = 0;
     if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (s_off) return CELL_OK;
+
+    /* PS3_EDGE_ZLIB_HLE=1: an Edge Zlib inflate queue is serviced on the host,
+     * as the Twisted Metal port does, instead of handing the element to the
+     * SPU task. God of War: Ascension's element (32 bytes, big-endian, read off
+     * its queue and checked against the request it describes):
+     *   +0x00 source (the request's +0x0C, past the 2-byte zlib header)
+     *   +0x04 destination (the request's in-place buffer, +0x14)
+     *   +0x08 compressed size   +0x0C output capacity
+     *   +0x10 the request's busy counter (+0x28), low bits used as flags
+     *   +0x14 an event flag     +0x18 its bits in the upper halfword
+     * The counter is what the title polls; it is decremented once the output
+     * is in place, and the event flag set when it reaches 0. */
+    { static int s_edge = -1;
+      if (s_edge < 0) s_edge = getenv("PS3_EDGE_ZLIB_HLE") ? 1 : 0;
+      if (s_edge) {
+          const uint32_t e = (uint32_t)data_ea;
+          const uint32_t src = vm_read32(e + 0x00), dst = vm_read32(e + 0x04);
+          const uint32_t srclen = vm_read32(e + 0x08), cap = vm_read32(e + 0x0C);
+          const uint32_t counter = vm_read32(e + 0x10) & ~3u;
+          const uint32_t flag = vm_read32(e + 0x14);
+          const u16 bits = (u16)(vm_read32(e + 0x18) >> 16);
+          extern int edge_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, uint32_t src_len);
+          if (src && dst && counter && srclen && srclen < 0x01000000u && cap && cap <= 0x01000000u) {
+              uint8_t* tmp = (uint8_t*)malloc(cap);
+              const int n = tmp ? edge_inflate(tmp, cap, vm_base + src, srclen) : -1;
+              if (n >= 0) memcpy(vm_base + dst, tmp, (size_t)n);
+              free(tmp);
+              const uint32_t left = vm_read32(counter);
+              if (left) vm_write32(counter, left - 1u);
+              if (left == 1u && flag && bits)
+                  cellSpursEventFlagSet((CellSpursEventFlag*)(uintptr_t)flag, bits);
+              static int _e = 0;
+              if (_e++ < 12 || n < 0)
+                  printf("[edge] inflate #%d src=0x%08X len=%u -> dst=0x%08X cap=%u: %d bytes; counter 0x%08X %u -> %u flag=0x%08X bits=0x%04X\n",
+                         _e, src, srclen, dst, cap, n, counter, left, left ? left - 1u : 0u, flag, bits);
+              return CELL_OK;
+          }
+      } }
 
     const uint32_t q = (uint32_t)queue_ea;
     /* Raw big-endian access while the lock-line lock is held: the vm_ accessors
