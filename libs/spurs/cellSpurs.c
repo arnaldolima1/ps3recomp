@@ -3512,8 +3512,15 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
      *   +0x08 compressed size   +0x0C output capacity
      *   +0x10 the request's busy counter (+0x28), low bits used as flags
      *   +0x14 an event flag     +0x18 its bits in the upper halfword
+     *   +0x24 output bytes to skip (also the low halfword of +0x18)
      * The counter is what the title polls; it is decremented once the output
-     * is in place, and the event flag set when it reaches 0. */
+     * is in place, and the event flag set when it reaches 0.
+     *
+     * The skip is how the title streams a compressed file in pieces: every
+     * request inflates from the start of the same stream, drops the first
+     * `skip` bytes and keeps the next `cap` (a WAD is read as a 64-byte chunk
+     * header, then its payload, then the next header). Ignoring it handed back
+     * the first chunk forever. */
     { static int s_edge = -1;
       if (s_edge < 0) s_edge = getenv("PS3_EDGE_ZLIB_HLE") ? 1 : 0;
       if (s_edge) {
@@ -3523,12 +3530,25 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
           const uint32_t counter = vm_read32(e + 0x10) & ~3u;
           const uint32_t flag = vm_read32(e + 0x14);
           const u16 bits = (u16)(vm_read32(e + 0x18) >> 16);
+          const uint32_t skip = vm_read32(e + 0x24);
           extern int edge_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, uint32_t src_len);
-          if (src && dst && counter && srclen && srclen < 0x01000000u && cap && cap <= 0x01000000u) {
-              uint8_t* tmp = (uint8_t*)malloc(cap);
-              const int n = tmp ? edge_inflate(tmp, cap, vm_base + src, srclen) : -1;
-              if (n >= 0) memcpy(vm_base + dst, tmp, (size_t)n);
-              free(tmp);
+          if (src && dst && counter && srclen && srclen < 0x01000000u && cap && cap <= 0x01000000u
+              && skip < 0x01000000u) {
+              uint8_t* buf = (uint8_t*)malloc((size_t)skip + cap);
+              const int full = buf ? edge_inflate(buf, skip + cap, vm_base + src, srclen) : -1;
+              const int n = full < 0 ? -1 : full > (int)skip ? full - (int)skip : 0;
+              uint8_t* tmp = buf ? buf + skip : NULL;
+              if (n > 0) memcpy(vm_base + dst, tmp, (size_t)n);
+              { static int _h = 0;
+                if (getenv("EDGE_DUMP") && n > 0 && cap <= 64 && _h++ < 8) {
+                    printf("[edge] elem");
+                    for (int k = 0; k < 64; k += 4) printf(" %08X", vm_read32(e + (uint32_t)k));
+                    printf("\n");
+                    printf("[edge] head src=0x%08X len=%u:", src, srclen);
+                    for (int k = 0; k < n && k < 64; k++) printf("%s%02X", (k % 16) ? " " : (k ? "\n    " : " "), tmp[k]);
+                    printf("\n");
+                } }
+              free(buf);
               const uint32_t left = vm_read32(counter);
               if (left) vm_write32(counter, left - 1u);
               if (left == 1u && flag && bits)
