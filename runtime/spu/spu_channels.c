@@ -742,6 +742,21 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
+            /* SPU_COMMIT_EA=<hex>: every committed PUTLLC on that line, under
+             * the lock-line lock: the words that change, before and after. */
+            { static int s_ce = -2; static uint32_t s_cl;
+              if (s_ce == -2) { const char* e = getenv("SPU_COMMIT_EA");
+                                s_cl = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_ce = s_cl ? 1 : 0; }
+              if (s_ce && (ea & ~127u) == s_cl) {
+                  char buf[512]; int p = snprintf(buf, sizeof buf, "[commit] img=%d pc=0x%05X ea=0x%08X",
+                                                  ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), (uint32_t)ea);
+                  for (int w = 0; w < 32 && p < (int)sizeof buf - 40; w++) {
+                      uint32_t o, n; memcpy(&o, (const uint8_t*)mem + 4*w, 4); memcpy(&n, (const uint8_t*)ls + 4*w, 4);
+                      if (o != n) p += snprintf(buf + p, sizeof buf - p, " +%02X:%08X->%08X", 4*w,
+                                                __builtin_bswap32(o), __builtin_bswap32(n));
+                  }
+                  fprintf(stderr, "%s\n", buf);
+              } }
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
