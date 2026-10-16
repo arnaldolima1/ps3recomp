@@ -68,7 +68,10 @@ typedef struct {
 } SpursTask;
 
 /* Global workload table (per-SPURS instance in a real system, simplified) */
-static SpursWorkload s_workloads[CELL_SPURS_MAX_WORKLOAD];
+/* A CellSpurs2 instance carries 32 workloads (wid 16-31 in a second set of
+ * instance fields), a first-generation one 16. */
+#define SPURS_MAX_WID 32
+static SpursWorkload s_workloads[SPURS_MAX_WID];
 static SpursTask     s_tasks[CELL_SPURS_MAX_TASK];
 static u32           s_next_task_id = 0;
 
@@ -418,12 +421,15 @@ enum {
     SPURS_WKL_MAXCONT  = 0x50,
     SPURS_WKL_FLAG     = 0x60,
     SPURS_WKL_SIGNAL1  = 0x70,
+    SPURS_WKL_SIGNAL2  = 0x78,   /* be u16, wid 16-31 */
     SPURS_NSPUS        = 0x76,
     SPURS_WKL_STATE1   = 0x80,
-    SPURS_WKL_ENABLED  = 0xB0,
+    SPURS_WKL_ENABLED  = 0xB0,   /* be u32, bit 31-wid for all 32 */
+    SPURS_WKL_STATE2   = 0xD0,   /* wid 16-31 */
     SPURS_SYSSRV_MSG   = 0xBD,
     SPURS_WKL_INFO1    = 0xB00,
     SPURS_WKL_INFO_SZ  = 0x20,
+    SPURS_WKL_INFO2    = 0x1200, /* wid 16-31 (CellSpurs2 only) */
     /* CELL_SPURS_SIZE = 4096 (SDK cell/spurs/types.h). The 8192-byte variant
      * is CellSpurs2 (cellSpursInitialize*2* NIDs) which LBP does not use —
      * clearing 0x2000 here overran the game's 4KB heap block and corrupted
@@ -436,6 +442,7 @@ static struct SpursInst {
     u32           ea;          /* 0 = free */
     u32           nspus;
     char          prefix[16];
+    u8            is2;         /* CellSpurs2: 8 KB, 32 workloads */
     volatile long kernel_live; /* poll thread started */
 } s_inst[MAX_SPURS_INST];
 
@@ -447,6 +454,23 @@ static struct SpursInst* spurs_inst_find(u32 ea)
 }
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+
+/* Instance fields of a workload: the first 16 and the CellSpurs2 second set
+ * (readyCount2 shares the idle-SPU-count bytes, as in libspurs). */
+static u32 wkl_ready_off(u32 wid) { return wid < 16 ? SPURS_WKL_READY1 + wid : SPURS_WKL_IDLE2 + (wid - 16); }
+static u32 wkl_state_off(u32 wid) { return wid < 16 ? SPURS_WKL_STATE1 + wid : SPURS_WKL_STATE2 + (wid - 16); }
+static u32 wkl_info_off(u32 wid)  { return wid < 16 ? SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ
+                                                    : SPURS_WKL_INFO2 + (wid - 16) * SPURS_WKL_INFO_SZ; }
+static int wkl_signalled(u32 ea, u32 wid)
+{
+    u32 sig = vm_read32(ea + (wid < 16 ? SPURS_WKL_SIGNAL1 : SPURS_WKL_SIGNAL2)) >> 16;
+    return (sig & (0x8000u >> (wid & 15))) != 0;
+}
+static void wkl_signal_clear(u32 ea, u32 wid)
+{
+    u32 off = wid < 16 ? SPURS_WKL_SIGNAL1 : SPURS_WKL_SIGNAL2;
+    vm_write32(ea + off, vm_read32(ea + off) & ~((0x8000u >> (wid & 15)) << 16));
+}
 
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 {
@@ -503,8 +527,15 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
 s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
                                       const CellSpursAttribute* attr)
 {
-    printf("[cellSpurs] InitializeWithAttribute2 -> InitializeWithAttribute\n");
-    return cellSpursInitializeWithAttribute(spurs, attr);
+    printf("[cellSpurs] InitializeWithAttribute2 -> InitializeWithAttribute (32 workloads)\n");
+    s32 rc = cellSpursInitializeWithAttribute(spurs, attr);
+    if (rc == CELL_OK) {
+        /* CellSpurs2 is 8 KB: the second workload set lives past 4 KB. */
+        const u32 ea = (u32)(uintptr_t)spurs;
+        struct SpursInst* si = spurs_inst_find(ea);
+        if (si) { si->is2 = 1; memset(vm_base + ea + SPURS_INST_SIZE, 0, SPURS_INST_SIZE); }
+    }
+    return rc;
 }
 
 static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
@@ -636,7 +667,7 @@ s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
     (void)maxContention;
 
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
     s_workloads[wid].maxContention = maxContention;
@@ -648,7 +679,7 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
 {
     if (!spurs || !priorities) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     const u8* priorities_h = GUEST_PTR(priorities, const u8*);
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
     memcpy(s_workloads[wid].priority, priorities_h, CELL_SPURS_MAX_SPU);
@@ -1309,7 +1340,8 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
     if (!si)
         return CELL_SPURS_CORE_ERROR_STAT;
 
-    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+    const u32 nwid = si->is2 ? SPURS_MAX_WID : 16;
+    for (u32 i = 0; i < nwid; i++) {
         if (!s_workloads[i].in_use) {
             s_workloads[i].in_use = 1;
             s_workloads[i].pm = pm;
@@ -1328,16 +1360,18 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             /* Publish the workload in the REAL BE instance so the game's
              * inlined kernel protocol (readyCount stores, signal bits, state
              * reads) and the policy module's own instance DMAs see it. */
-            u32 info = spurs_ea + SPURS_WKL_INFO1 + i * SPURS_WKL_INFO_SZ;
+            u32 info = spurs_ea + wkl_info_off(i);
             vm_write64(info + 0x00, (u64)(uintptr_t)pm);        /* addr */
             vm_write64(info + 0x08, data);                       /* arg  */
             vm_write32(info + 0x10, sizePm);                     /* size */
             vm_write32(info + 0x14, i << 24);                    /* uniqueId */
             for (int b = 0; b < 8; b++)
                 *(vm_base + info + 0x18 + b) = priority_h ? priority_h[b] : 0;
-            *(vm_base + spurs_ea + SPURS_WKL_STATE1  + i) = 2;   /* runnable */
-            *(vm_base + spurs_ea + SPURS_WKL_MINCONT + i) = (u8)(minContention ? minContention : 1);
-            *(vm_base + spurs_ea + SPURS_WKL_MAXCONT + i) = (u8)(maxContention ? maxContention : 1);
+            *(vm_base + spurs_ea + wkl_state_off(i)) = 2;        /* runnable */
+            if (i < 16) {   /* the second set's contention lives in host state */
+                *(vm_base + spurs_ea + SPURS_WKL_MINCONT + i) = (u8)(minContention ? minContention : 1);
+                *(vm_base + spurs_ea + SPURS_WKL_MAXCONT + i) = (u8)(maxContention ? maxContention : 1);
+            }
             vm_write32(spurs_ea + SPURS_WKL_ENABLED,
                        vm_read32(spurs_ea + SPURS_WKL_ENABLED) | (0x80000000u >> i));
             *(vm_base + spurs_ea + SPURS_SYSSRV_MSG) = 0xFF;
@@ -1515,7 +1549,7 @@ s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameIns
 s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
     s_workloads[wid].in_use = 0;
@@ -1564,7 +1598,7 @@ typedef struct {
     int                 image_id;
     int                 resolved;   /* 0=not tried, 1=found, -1=missing */
 } WklPm;
-static WklPm s_wkl_pm[CELL_SPURS_MAX_WORKLOAD];
+static WklPm s_wkl_pm[SPURS_MAX_WID];
 
 static WklPm* spurs_resolve_pm(u32 wid)
 {
@@ -1672,25 +1706,25 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
          * even for wids the dispatch filter below would skip — the game pokes
          * these bytes with inlined atomics and this is our only tap. */
         {
-            static int _seen[MAX_SPURS_INST][16];
+            static int _seen[MAX_SPURS_INST][SPURS_MAX_WID];
             int slot = (int)(si - s_inst);
-            u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;
-            for (u32 w = 0; w < 16; w++) {
-                u8 rc = *(vm_base + ea + SPURS_WKL_READY1 + w);
-                if ((rc || (sig & (0x8000u >> w))) && _seen[slot][w] < 4) {
+            for (u32 w = 0; w < (si->is2 ? SPURS_MAX_WID : 16u); w++) {
+                u8 rc = *(vm_base + ea + wkl_ready_off(w));
+                u32 sig = wkl_signalled(ea, w) ? (0x8000u >> (w & 15)) : 0;
+                if ((rc || sig) && _seen[slot][w] < 4) {
                     _seen[slot][w]++;
                     fprintf(stderr, "[spurs-kern] \"%s\" POKE wid=%u ready=%u sig=%u enabled=%d state=%u\n",
-                            si->prefix, w, rc, (sig >> (15 - w)) & 1,
+                            si->prefix, w, rc, sig ? 1u : 0u,
                             (enabled >> (31 - w)) & 1,
-                            *(vm_base + ea + SPURS_WKL_STATE1 + w));
+                            *(vm_base + ea + wkl_state_off(w)));
                 }
             }
         }
         if (!enabled) continue;
 
-        for (u32 wid = 0; wid < 16; wid++) {
+        for (u32 wid = 0; wid < (si->is2 ? SPURS_MAX_WID : 16u); wid++) {
             if (!(enabled & (0x80000000u >> wid))) continue;
-            if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) continue;
+            if (*(vm_base + ea + wkl_state_off(wid)) != 2) continue;
             if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
 
             /* A SPURS policy module is a PERSISTENT SPU program. The real kernel
@@ -1710,13 +1744,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              *
              * readyCount/wklSignal are still honoured when a title DOES use them:
              * consume one unit so a kick-driven title paces the same as before. */
-            volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
-            u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
-            int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
+            volatile u8* rdy = vm_base + ea + wkl_ready_off(wid);
+            const int sg = wkl_signalled(ea, wid);
+            int kicked = (*rdy != 0) || sg;
             if (*rdy) (*rdy)--;
-            if (sig & (0x8000u >> wid))
-                vm_write32(ea + SPURS_WKL_SIGNAL1,
-                           (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
+            if (sg) wkl_signal_clear(ea, wid);
 
             WklPm* r = spurs_resolve_pm(wid);
             if (!r) continue;
@@ -1729,7 +1761,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * ... up to 16th pass; an explicit kick (readyCount/signal) resets
              * it to every pass, so kick-driven latency is unchanged. */
             {
-                static u8 s_idle[CELL_SPURS_MAX_WORKLOAD];      /* idle streak (log2 cadence) */
+                static u8 s_idle[SPURS_MAX_WID];      /* idle streak (log2 cadence) */
                 static u32 s_pass_no;                            /* shared pass counter is fine */
                 if (wid == 0) s_pass_no++;
                 if (kicked) s_idle[wid] = 0;
@@ -1746,7 +1778,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     fflush(stderr); } }
 
             /* Live workload arg from the real wklInfo (the game may update it). */
-            u64 arg = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+            u64 arg = vm_read64(ea + wkl_info_off(wid) + 8);
             /* Dispatch once per VIRTUAL SPU up to the workload's maxContention:
              * the WWS job manager keys its per-SPU ticket lane off the kernel
              * context's spuNum, and its command lists carry cross-lane BARRIER
@@ -1755,7 +1787,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * deadlocked: LBP's post-intro loading froze with 8 ready jobs and
              * the lanes stuck at {1,0,...} against ticket 10+. Sequential
              * per-lane rounds converge where parallel SPUs would. */
-            u8 maxcont = *(vm_base + ea + SPURS_WKL_MAXCONT + wid);
+            u8 maxcont = wid < 16 ? *(vm_base + ea + SPURS_WKL_MAXCONT + wid)
+                                  : (u8)s_workloads[wid].maxContention;
             if (maxcont < 1) maxcont = 1;
             if (maxcont > 6) maxcont = 6;
             /* Do NOT exceed the workload's own contention: per-SPU rows in
@@ -1781,7 +1814,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
               if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS");
                 s_fs = e ? atoi(e) : -1; }
               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
-            *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
+            if (wid < 16) *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
             {
                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
                 uint32_t sz = s_workloads[wid].sizePm;
@@ -1808,7 +1841,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                     }
                 }
             }
-            *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+            if (wid < 16) *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
             /* "Found work" heuristic: a module that did something polls the
              * kernel for MORE work before exiting (selectWorkload calls >0);
              * an idle module exits immediately with polls==0. Grow the idle
@@ -1824,12 +1857,12 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
                              u32 value)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
     s_workloads[wid].readyCount = value;
     /* The real store: the instance byte the kernel (poll thread) watches. */
-    *(vm_base + (u32)(uintptr_t)spurs + SPURS_WKL_READY1 + wid) = (u8)value;
+    *(vm_base + (u32)(uintptr_t)spurs + wkl_ready_off(wid)) = (u8)value;
     {   static int _n = 0;
         if (_n < 32)
             printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
@@ -1844,7 +1877,7 @@ s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
                             u32* old, u32 value)
 {
     if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
     vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
@@ -1857,7 +1890,7 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
                                        u32* old, u32 compare, u32 value)
 {
     if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
     vm_write32((u32)(uintptr_t)old, s_workloads[wid].readyCount);
@@ -1892,7 +1925,7 @@ s32 cellSpursWakeUp(CellSpurs* spurs)
      * are common -- the guest calls it whenever it adds work) does not spawn
      * another copy. */
     const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
-    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+    for (u32 i = 0; i < SPURS_MAX_WID; i++) {
         SpursWorkload* w = &s_workloads[i];
         if (!w->in_use || w->started || w->spurs_ea != spurs_ea) continue;
         if (!w->pm || !w->sizePm) continue;
@@ -3074,7 +3107,7 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 
     if (!spurs_ea || !info_ea)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use)
+    if (wid >= SPURS_MAX_WID || !s_workloads[wid].in_use)
         return CELL_SPURS_CORE_ERROR_INVAL;
 
     /* CellSpursWorkloadInfo is a GUEST out-buffer (cell/spurs/workload_types.h),
@@ -3095,13 +3128,13 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     /* nameClass/nameInstance (0x18/0x1C): not tracked -> left 0 by the zero above. */
 
     u32 se = (u32)spurs_ea;
-    *(vm_base + base + 0x20) = *(vm_base + se + SPURS_WKL_CURCONT + wid);  /* contention   */
+    *(vm_base + base + 0x20) = wid < 16 ? *(vm_base + se + SPURS_WKL_CURCONT + wid) : 0;  /* contention */
     *(vm_base + base + 0x21) = (u8)w->minContention;                       /* minContention */
     *(vm_base + base + 0x22) = (u8)w->maxContention;                       /* maxContention */
-    *(vm_base + base + 0x23) = *(vm_base + se + SPURS_WKL_READY1 + wid);   /* readyCount   */
-    *(vm_base + base + 0x24) = *(vm_base + se + SPURS_WKL_IDLE2  + wid);   /* idleSpuRequest */
-    u32 sig = vm_read32(se + SPURS_WKL_SIGNAL1) >> 16;
-    *(vm_base + base + 0x25) = (sig & (0x8000u >> wid)) ? 1 : 0;           /* hasSignal    */
+    *(vm_base + base + 0x23) = *(vm_base + se + wkl_ready_off(wid));       /* readyCount   */
+    /* idleSpuRequest: the second set's bytes are its readyCount */
+    *(vm_base + base + 0x24) = wid < 16 ? *(vm_base + se + SPURS_WKL_IDLE2 + wid) : 0;
+    *(vm_base + base + 0x25) = wkl_signalled(se, wid) ? 1 : 0;             /* hasSignal    */
     return CELL_OK;
 }
 

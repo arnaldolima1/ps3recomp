@@ -438,6 +438,25 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             fprintf(stderr,"[spu-trace] LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n",
                 LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
             #undef LB
+            /* The loop itself: code around pc and the preferred word of every
+             * register, enough to decode what it is waiting for. */
+            { uint32_t from = (ctx->pc & 0x3FFF0u) >= 0x80u ? (ctx->pc & 0x3FFF0u) - 0x80u : 0u;
+              for (uint32_t a = from; a < from + 0x100u && a < 0x40000u; a += 16) {
+                  fprintf(stderr, "[spu-trace] LS %05X:", a);
+                  for (int k = 0; k < 16; k += 4)
+                      fprintf(stderr, " %02X%02X%02X%02X", ctx->ls[a+k], ctx->ls[a+k+1], ctx->ls[a+k+2], ctx->ls[a+k+3]);
+                  fprintf(stderr, "\n");
+              }
+              fprintf(stderr, "[spu-trace] mfc_eah=%08X img=%d\n", ctx->mfc_eah, ctx->image_id);
+              for (uint32_t a = 0x80; a < 0x100; a += 16)
+                  fprintf(stderr, "[spu-trace] LS %05X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", a,
+                          ctx->ls[a],ctx->ls[a+1],ctx->ls[a+2],ctx->ls[a+3], ctx->ls[a+4],ctx->ls[a+5],ctx->ls[a+6],ctx->ls[a+7],
+                          ctx->ls[a+8],ctx->ls[a+9],ctx->ls[a+10],ctx->ls[a+11], ctx->ls[a+12],ctx->ls[a+13],ctx->ls[a+14],ctx->ls[a+15]);
+              for (int r = 0; r < 128; r += 8) {
+                  fprintf(stderr, "[spu-trace] r%-3d", r);
+                  for (int k = 0; k < 8; k++) fprintf(stderr, " %08X", ctx->gpr[r + k]._u32[0]);
+                  fprintf(stderr, "\n");
+              } }
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
         }
         if (spu_step(ctx)) {
