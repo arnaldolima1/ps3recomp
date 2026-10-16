@@ -998,6 +998,23 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
     return n;
 }
 
+/* Signal every parked task whose wait object lies in the 128-byte line
+ * `line`, whatever its taskset. A queue whose eaSignal names the SPURS
+ * instance rather than a taskset (an LFQueue made on the SPURS) is waited on
+ * through its own line: God of War: Ascension's task waits with the object
+ * 0x15E66A85 on the queue at 0x15E66A80. Returns how many. */
+int spu_signal_parked_on_line(uint32_t line)
+{
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k || !s_parked_obj[i] || (s_parked_obj[i] & ~127u) != (line & ~127u)) continue;
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
 /* Deliver a signal to a task (callable from any PPU/host thread). */
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {

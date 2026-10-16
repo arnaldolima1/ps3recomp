@@ -38,6 +38,41 @@ extern "C" void ydkj_host_bt(const char* tag);
 #define O_BINARY 0       /* POSIX has no text/binary distinction */
 #endif
 
+/* File positions and sizes in 64 bits. On Windows `long` is 32 bits, so
+ * fseek/ftell/stat stop at 2 GB: God of War: Ascension's RESOURCES.PSARC
+ * (2,155,167,329 bytes) could not be mounted, and the game's init gave up. */
+static int host_fseek64(FILE* f, int64_t off, int origin)
+{
+#ifdef _WIN32
+    return _fseeki64(f, (__int64)off, origin);
+#else
+    return fseeko(f, (off_t)off, origin);
+#endif
+}
+static int64_t host_ftell64(FILE* f)
+{
+#ifdef _WIN32
+    return (int64_t)_ftelli64(f);
+#else
+    return (int64_t)ftello(f);
+#endif
+}
+/* stat() with a 64-bit size: 0 on success, the size and whether it is a
+ * directory written out. */
+static int host_stat64(const char* path, int64_t* size, int* is_dir)
+{
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) != 0) return -1;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+#endif
+    if (size) *size = (int64_t)st.st_size;
+    if (is_dir) *is_dir = (st.st_mode & S_IFMT) == S_IFDIR;
+    return 0;
+}
+
 extern "C" uint8_t* vm_base;
 extern "C" void ppu_guest_caller(char* out, size_t n);
 extern "C" uint32_t ppu_vm_size;
@@ -531,8 +566,8 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
-    long p = ftell(g_files[fd]);
+    host_fseek64(g_files[fd], off, worigin);
+    int64_t p = host_ftell64(g_files[fd]);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -563,16 +598,16 @@ static void cellFsStat(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
-    struct stat st;
-    if (stat(hpath, &st) != 0) {
+    int64_t st_size = 0; int st_dir = 0;
+    if (host_stat64(hpath, &st_size, &st_dir) != 0) {
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
-    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
-    uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
-                                           : (CELL_FS_S_IFREG | 0x1B6);
-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
-    if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st_size);
+    uint32_t mode = st_dir ? (CELL_FS_S_IFDIR | 0x1FF)
+                           : (CELL_FS_S_IFREG | 0x1B6);
+    if (sb) write_stat(sb, mode, (uint64_t)st_size);
+    if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st_size);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -583,10 +618,10 @@ static void cellFsFstat(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    long cur = ftell(g_files[fd]);
-    fseek(g_files[fd], 0, SEEK_END);
-    long sz = ftell(g_files[fd]);
-    fseek(g_files[fd], cur, SEEK_SET);
+    int64_t cur = host_ftell64(g_files[fd]);
+    host_fseek64(g_files[fd], 0, SEEK_END);
+    int64_t sz = host_ftell64(g_files[fd]);
+    host_fseek64(g_files[fd], cur, SEEK_SET);
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -595,12 +630,12 @@ static void cellFsFstat(ppu_context* ctx)
     { const char* cap = getenv("FS_FSTAT_CAP");
       const char* only = getenv("FS_FSTAT_CAP_PATH");
       if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
-      if (cap) { long c = strtol(cap, 0, 0);
+      if (cap) { long long c = strtoll(cap, 0, 0);
           if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
+              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
               sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
 

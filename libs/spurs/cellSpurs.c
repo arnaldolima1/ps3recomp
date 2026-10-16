@@ -3352,6 +3352,63 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
     return CELL_OK;
 }
 
+/* _cellSpursLFQueuePushBody(CellSpursLFQueue*, const void* buffer, bool isBlocking)
+ *
+ * The producer side of the ring cellSpursQueuePushBody models (see there and
+ * _cellSpursLFQueueInitialize): W0 at +0x00 the pop index, W1 at +0x04 the
+ * push index, both modulo 2*W3 (W3 at +0x0C the depth), the slot index mod W3,
+ * elements of +0x10 bytes from the buffer at +0x18. Written under the
+ * lock-line lock, and reserving SPUs are told, as the event flag does; then
+ * the task parked on this queue's line is woken. God of War: Ascension
+ * (BCES01741) feeds its first SPU task this way right after its init; with
+ * the import unregistered, the task waited forever. A full queue answers
+ * BUSY when not blocking, and waits for room when blocking.
+ * SPURS_LFQUEUE_NO_PUSH=1 makes it a logged no-op, as before. */
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
+{
+    static int s_off = -1;
+    if (s_off < 0) s_off = getenv("SPURS_LFQUEUE_NO_PUSH") ? 1 : 0;
+    static int _n = 0;
+    if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (s_off) return CELL_OK;
+
+    const uint32_t q = (uint32_t)queue_ea;
+    /* Raw big-endian access while the lock-line lock is held: the vm_ accessors
+     * take that same (non-recursive) lock. */
+    #define LFQ_R32(a) ((uint32_t)vm_base[(a)] << 24 | (uint32_t)vm_base[(a) + 1] << 16 | (uint32_t)vm_base[(a) + 2] << 8 | (uint32_t)vm_base[(a) + 3])
+    for (int attempt = 0;; attempt++) {
+        spu_lockline_lock();
+        int32_t  w0  = (int32_t)LFQ_R32(q + 0x00);
+        int32_t  w1  = (int32_t)LFQ_R32(q + 0x04);
+        int32_t  w3  = (int32_t)LFQ_R32(q + 0x0C);
+        uint32_t sz  = LFQ_R32(q + 0x10);
+        uint32_t buf = LFQ_R32(q + 0x1C);   /* low word of the u64 at +0x18 */
+        if (w3 <= 0 || !sz || !buf) { spu_lockline_unlock(); return CELL_SPURS_TASK_ERROR_INVAL; }
+        int32_t pop  = (w0 < 0) ? ~w0 : w0;
+        int32_t push = (w1 < 0) ? ~w1 : w1;
+        int32_t used = ((push - pop) % (2 * w3) + 2 * w3) % (2 * w3);
+        if (used < w3) {
+            uint32_t slot = (uint32_t)(push % w3);
+            memcpy(vm_base + buf + (size_t)slot * sz, vm_base + (uint32_t)data_ea, sz);
+            {   uint32_t v = (uint32_t)((push + 1) % (2 * w3));
+                vm_base[q + 4] = (uint8_t)(v >> 24); vm_base[q + 5] = (uint8_t)(v >> 16);
+                vm_base[q + 6] = (uint8_t)(v >> 8);  vm_base[q + 7] = (uint8_t)v; }
+            ef_line_end(q);
+            extern int spu_signal_parked_on_line(uint32_t line);
+            int woke = spu_signal_parked_on_line(q);
+            if (_n++ < 16)
+                printf("[cellSpurs] LFQueuePush#%d q=0x%08X slot=%u push %d->%d pop=%d used=%d depth=%d size=%u woke=%d\n",
+                       _n, q, slot, push, (push + 1) % (2 * w3), pop, used, w3, sz, woke);
+            return CELL_OK;
+        }
+        spu_lockline_unlock();
+        if (!isBlocking) return CELL_SPURS_TASK_ERROR_BUSY;
+        if (attempt == 0) printf("[cellSpurs] LFQueuePush q=0x%08X full (used=%d), waiting\n", q, used);
+        Sleep(1);
+    }
+    #undef LFQ_R32
+}
+
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
 {
     static int _n = 0;
