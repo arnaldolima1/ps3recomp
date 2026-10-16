@@ -219,6 +219,9 @@ s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
 s32 _cellSpursTasksetAttribute2Initialize(void* attr, u32 revision);
 s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset,
                             const void* attr);
+s32 _cellSpursTaskAttribute2Initialize(void* attr, u32 revision);
+s32 cellSpursCreateTask2(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                         void* elf, u32 argument_ea, u32 attr_ea);
 
 s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads);
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
