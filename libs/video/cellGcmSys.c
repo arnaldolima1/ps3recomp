@@ -1874,6 +1874,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+                    /* GCM_SEMALOG=1: every RELEASE, and each ACQUIRE once per (offset, value)
+                     * with what the label holds then. */
+                    { static int sl = -1; static u32 last_off = ~0u, last_v = ~0u;
+                      if (sl < 0) sl = getenv("GCM_SEMALOG") ? 1 : 0;
+                      if (sl && m == 0x6Cu)
+                          printf("[sema] t=%llu RELEASE off=0x%X <- 0x%08X get=0x%X%c", (unsigned long long)ps3_ms_now(), s_sema_offset, v, s_fifo_getoff, 10);
+                      if (sl && m == 0x68u && (s_sema_offset != last_off || v != last_v)) {
+                          last_off = s_sema_offset; last_v = v;
+                          printf("[sema] t=%llu ACQUIRE off=0x%X want 0x%08X has 0x%08X get=0x%X%c", (unsigned long long)ps3_ms_now(),
+                                 s_sema_offset, v, vm_read32(la), s_fifo_getoff, 10); } }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) vm_write32(la, v);
                     else if (m == 0x68u && vm_read32(la) != v) {
@@ -1886,9 +1896,27 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if (blk) { sem_blocked = 1; break; }
         }
                 }
-                if (sem_blocked) break;
+                if (sem_blocked) { why = "sema-acquire"; break; }
                 s_fifo_getoff += 4 + count * 4;
                 continue;
+            }
+            /* GCM_FLIP_PACE_MS=<ms>: a flip in the command stream waits until that
+             * long after the previous one, the way a vsync flip holds a real RSX
+             * (the pass stops here without consuming the method, as a blocked
+             * ACQUIRE does). Off by default. Recompiled, the RSX side runs far
+             * faster than the SPU work it is meant to overlap: God of War:
+             * Ascension's frame 2 reports used to land while its SPU post-process
+             * tasks were still on frame 1, and RsxSync's signal for the next
+             * round was eaten by their barrier waits. */
+            if ((((subch << 13) | method) == 0xE920u || ((subch << 13) | method) == 0xE924u)) {
+                static long pace = -1; static unsigned long long last_flip;
+                if (pace < 0) { const char* e = getenv("GCM_FLIP_PACE_MS"); pace = e ? atol(e) : 0; }
+                if (pace > 0) {
+                    extern unsigned long long ps3_ms_now(void);
+                    const unsigned long long now = ps3_ms_now();
+                    if (last_flip && now - last_flip < (unsigned long long)pace) { why = "flip-pace"; break; }
+                    last_flip = now;
+                }
             }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
@@ -2030,12 +2058,33 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
                         const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
                         const u64 ts = gcm_report_timestamp();
+                        { extern volatile long g_gcm_report_count; g_gcm_report_count++; }
                         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
                         { /* GCM_REPORTLOG=<n>: the first n reports (default 6), with the time. */
                           static long rn = 0, rmax = -1;
                           if (rmax < 0) { const char* e = getenv("GCM_REPORTLOG"); rmax = e ? atol(e) : 6; }
                           if (rn++ < rmax) printf("[GET_REPORT] t=%llu type=%u off=0x%X dma=0x%08X%c",
-                                                  (unsigned long long)ps3_ms_now(), v >> 24, off, s_report_dma, 10); }
+                                                  (unsigned long long)ps3_ms_now(), v >> 24, off, s_report_dma, 10);
+                          /* GCM_REPORTFF=1: a GET_REPORT word still 0xFFFFFFFF (a placeholder
+                           * not patched yet): where it is, its neighbours, and what the same
+                           * word holds when the next reports go by. */
+                          static int ff = -1; static u32 ff_ea[8]; static int ff_n;
+                          if (ff < 0) ff = getenv("GCM_REPORTFF") ? 1 : 0;
+                          if (ff) {
+                              for (int k = 0; k < ff_n; k++)
+                                  printf("[reportff] later ea=0x%08X now 0x%08X%c", ff_ea[k], vm_read32(ff_ea[k]), 10);
+                              ff_n = 0;
+                              if (v == 0xFFFFFFFFu) {
+                                  printf("[reportff] get=0x%X ea=0x%08X:", s_fifo_getoff, dea);
+                                  for (int k = -8; k <= 8; k++) printf(" %08X", vm_read32(dea + 4u * (u32)k));
+                                  printf("%c", 10);
+                                  if (ff_n < 8) ff_ea[ff_n++] = dea;
+                                  const u32 tea = gcm_io2ea(off);
+                                  printf("[reportff] target ea=0x%08X before:", tea);
+                                  for (int k = -4; k < 8; k++) printf(" %08X", tea ? vm_read32((tea & ~3u) + 4u * (u32)k) : 0u);
+                                  printf("%c", 10);
+                              }
+                          } }
                         if (main_mem) {
                             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
                             const u32 rea = gcm_io2ea(off);
@@ -2109,8 +2158,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * patches the park afterwards; resyncing to put dropped those segments,
      * the GPU reports in them were never written, the RsxSync workload's
      * barrier never passed, and the frames stopped after the fifth. */
+    /* A blocked semaphore ACQUIRE (GCM_SEMA_ACQUIRE=1) is not stuck either: the
+     * GPU waits there by design until the label is released. Ascension's
+     * frame waits on a label its SPU post-process tasks write when they are
+     * done with the frame; following put dropped the frame mid-wait. */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (why && strcmp(why, "parked") == 0) { stuck = 0; last = s_fifo_getoff; }
+      if (why && (strcmp(why, "parked") == 0 || strcmp(why, "sema-acquire") == 0 || strcmp(why, "flip-pace") == 0)) { stuck = 0; last = s_fifo_getoff; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }

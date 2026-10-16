@@ -909,6 +909,30 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
             return;
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+        /* SPU_MFCLOG_IMG=<image> [SPU_MFCLOG_MAX=<n>]: every plain GET/PUT that
+         * image issues (cmd, LS, EA, size and up to 64 bytes, read after the
+         * transfer), for lifted code the interpreter hooks never see. */
+        if (channel == MFC_Cmd) {
+            static int s_mi = -2, s_nea; static long s_mn, s_mmax; static uint32_t s_mea[8];
+            if (s_mi == -2) { const char* e = getenv("SPU_MFCLOG_IMG"); s_mi = e ? atoi(e) : -1;
+                              const char* m = getenv("SPU_MFCLOG_MAX"); s_mmax = m ? atol(m) : 20000;
+                              const char* a = getenv("SPU_MFCLOG_EA");
+                              while (a && *a && s_nea < 8) { char* end; s_mea[s_nea++] = (uint32_t)strtoul(a, &end, 16) & ~127u;
+                                                            a = (*end == ',') ? end + 1 : NULL; } }
+            /* SPU_MFCLOG_EA=<hex>[,<hex>...]: any image's GET/PUT that touches one of those 128-byte lines. */
+            int hit_ea = 0;
+            for (int k = 0; k < s_nea; k++)
+                if ((ctx->mfc_eal & ~127u) == s_mea[k] || ((ctx->mfc_eal + ctx->mfc_size - 1u) & ~127u) == s_mea[k]) hit_ea = 1;
+            if (((s_mi >= 0 && ctx->image_id == s_mi) || hit_ea) && s_mn++ < s_mmax) {
+                const uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK, n = ctx->mfc_size < 64u ? ctx->mfc_size : 64u;
+                extern int spu_workload_current_task(void);
+                char line[320]; int o = snprintf(line, sizeof line, "[mfclog] img=%d task=%d spu=%u cmd=%02X lsa=%05X ea=%08X size=%X tag=%u:",
+                                                  ctx->image_id, spu_workload_current_task(), ctx->spu_id, v & 0xFFu, lsa, ctx->mfc_eal, ctx->mfc_size, ctx->mfc_tag);
+                for (uint32_t k = 0; k < n && lsa + k < SPU_LS_SIZE; k++)
+                    o += snprintf(line + o, sizeof line - (size_t)o, (k & 3) ? "%02X" : " %02X", ctx->ls[lsa + k]);
+                fprintf(stderr, "%s\n", line);
+            }
+        }
         /* SPU_EVLOG=1: MFC_WrTagMask / MFC_WrTagUpdate writes under a policy
          * module, with the event mask they meet (first 400). */
         if (channel == MFC_WrTagUpdate || channel == MFC_WrTagMask || channel == MFC_WrListStallAck)

@@ -388,8 +388,38 @@ uint32_t g_spu_interp_last_pc = 0;
  * reaches one of these LS addresses (runtime-loaded job code has no lifted
  * symbol to break on), with the first word at LS 0x4000 to tell job modules
  * apart. */
+/* GET_REPORTs the FIFO walker has executed (cellGcmSys counts them): lets a
+ * trace start at a given frame instead of burning its budget during boot. */
+volatile long g_gcm_report_count = 0;
 void spu_pcwatch(spu_context* ctx, uint32_t pc)
 {
+    /* SPU_ITRACE_MOD=<hex> [SPU_ITRACE_WID=<wid>] [SPU_ITRACE_MAX=<n>]
+     * [SPU_ITRACE_LO/HI=<hex LS range>] [SPU_ITRACE_ARM=<n GET_REPORTs first>]: every
+     * interpreted step while that job module (the word at LS 0x4000) is
+     * loaded -- pc, the instruction word, r2-r9 -- to follow runtime-loaded job
+     * code that has no lifted symbols. */
+    { static int s_it = -1; static uint32_t s_mod, s_lo, s_hi; static long s_max, s_arm; static int s_wid;
+      if (s_it < 0) { const char* e = getenv("SPU_ITRACE_MOD"); s_it = e ? 1 : 0;
+                      s_mod = e ? (uint32_t)strtoul(e, 0, 16) : 0;
+                      const char* m = getenv("SPU_ITRACE_MAX"); s_max = m ? atol(m) : 200000;
+                      const char* w = getenv("SPU_ITRACE_WID"); s_wid = w ? atoi(w) : -1;
+                      const char* lo = getenv("SPU_ITRACE_LO"); s_lo = lo ? (uint32_t)strtoul(lo, 0, 16) : 0;
+                      const char* hi = getenv("SPU_ITRACE_HI"); s_hi = hi ? (uint32_t)strtoul(hi, 0, 16) : 0x40000;
+                      const char* ar = getenv("SPU_ITRACE_ARM"); s_arm = ar ? atol(ar) : 0; }
+      if (s_it) {
+          const uint32_t mod = ((uint32_t)ctx->ls[0x4000] << 24) | ((uint32_t)ctx->ls[0x4001] << 16)
+                             | ((uint32_t)ctx->ls[0x4002] << 8) | ctx->ls[0x4003];
+          if (mod == s_mod && g_gcm_report_count >= s_arm && pc >= s_lo && pc < s_hi && (s_wid < 0 || ctx->ls[0x1DF] == (unsigned)s_wid)) {
+              static long n;
+              if (n++ < s_max) {
+                  const uint8_t* q = ctx->ls + (pc & 0x3FFFC);
+                  fprintf(stderr, "[itrace] spu=%u pc=%05X w=%02X%02X%02X%02X r2=%08X r3=%08X %08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X\n",
+                          ctx->ls[0x1CB], pc, q[0], q[1], q[2], q[3],
+                          ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[4]._u32[0],
+                          ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0], ctx->gpr[7]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[9]._u32[0]);
+              }
+          }
+      } }
     static int s_pw_n = -1; static uint32_t s_pw[8];
     if (s_pw_n < 0) { int n = 0; const char* e = getenv("SPU_PCWATCH");
         while (e && *e && n < 8) { char* end; s_pw[n++] = (uint32_t)strtoul(e, &end, 16);

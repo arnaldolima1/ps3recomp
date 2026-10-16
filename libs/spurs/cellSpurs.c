@@ -1897,6 +1897,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
           const unsigned long long now = GetTickCount64();
           if (s_wd > 0 && now >= s_next) {
               s_next = now + (unsigned long long)s_wd * 1000ull;
+              /* The scheduler's own view: each SPU slot, and per workload the
+               * SPUs it holds, its readyCount, signal and idle back-off. */
+              for (u32 k = 0; k < si->nspus; k++)
+                  fprintf(stderr, "[wl-dump] t=%llu slot %u busy=%d wid=%u\n", now, k,
+                          si->slots[k].busy, si->slots[k].wid);
+              for (u32 w = 0; w < (si->is2 ? SPURS_MAX_WID : 16u); w++)
+                  if (s_workloads[w].in_use && s_workloads[w].spurs_ea == ea)
+                      fprintf(stderr, "[wl-dump] t=%llu wid=%u state=%u active=%u ready=%u sig=%d idle=%u enabled=%d\n",
+                              now, w, vm_read8(ea + wkl_state_off(w)), si->active[w], vm_read8(ea + wkl_ready_off(w)),
+                              wkl_signalled(ea, w), si->idle[w], (enabled & (0x80000000u >> w)) != 0);
               for (u32 w = 0; w < (si->is2 ? SPURS_MAX_WID : 16u); w++) {
                   if (!s_workloads[w].in_use || s_workloads[w].spurs_ea != ea) continue;
                   const u32 d = (u32)vm_read64(ea + wkl_info_off(w) + 8);

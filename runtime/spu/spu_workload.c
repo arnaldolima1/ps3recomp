@@ -1093,9 +1093,15 @@ void spu_taskset_line_committed(uint32_t line)
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
  * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
  * until one is delivered. Returns 0 (the syscall's success rc). */
+/* The SPURS task this host thread runs (each task has its own), or -1: for
+ * diagnostics that want to tell the tasks of one image apart. */
+static _Thread_local int s_cur_task = -1;
+int spu_workload_current_task(void) { return s_cur_task; }
+
 int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
+    s_cur_task = (int)taskId;
     /* ran= is the wall time this task spent OUT of the wait (decode/mix work
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
@@ -1183,6 +1189,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     spu_serial_acquire();       /* resume: re-take the serial lock */
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
+    { static int _x = -1; if (_x < 0) _x = getenv("SPU_WAITSIG_EXITLOG") ? 1 : 0;
+      if (_x) fprintf(stderr, "[spu_workload] WAIT_SIGNAL exit task=%u taskset=0x%08X t=%llu\n",
+                      taskId, taskset_ea, (unsigned long long)s_wait_exit_ms); }
     return 0;
 }
 
