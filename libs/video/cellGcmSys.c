@@ -2031,7 +2031,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
                         const u64 ts = gcm_report_timestamp();
                         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
-                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+                        { /* GCM_REPORTLOG=<n>: the first n reports (default 6), with the time. */
+                          static long rn = 0, rmax = -1;
+                          if (rmax < 0) { const char* e = getenv("GCM_REPORTLOG"); rmax = e ? atol(e) : 6; }
+                          if (rn++ < rmax) printf("[GET_REPORT] t=%llu type=%u off=0x%X dma=0x%08X%c",
+                                                  (unsigned long long)ps3_ms_now(), v >> 24, off, s_report_dma, 10); }
                         if (main_mem) {
                             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
                             const u32 rea = gcm_io2ea(off);
@@ -2098,8 +2102,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
           }
       } else burned = 0; }
 
+    /* A pass that stopped on a self-JUMP park is not stuck: the park has its
+     * own grace before it gives up (gcm_park_grace_ms, GCM_PARK_WAIT_MS), and
+     * this rule -- eight passes, some 30 ms -- overrode it. God of War:
+     * Ascension parks the RSX while its SPU jobs fill the next segment and
+     * patches the park afterwards; resyncing to put dropped those segments,
+     * the GPU reports in them were never written, the RsxSync workload's
+     * barrier never passed, and the frames stopped after the fifth. */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
+      if (why && strcmp(why, "parked") == 0) { stuck = 0; last = s_fifo_getoff; }
+      else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }

@@ -106,6 +106,25 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
 #define I   (d.imm)
 #define PREF(r) ((r)._u32[0])
 
+/* SPU_JOBAPI_LOG=1: calls from interpreted job code (LS >= 0x4000) into the
+ * resident policy module below it -- a Wws job's job-API calls -- with the
+ * job module (the word at LS 0x4000), the workload and the argument
+ * registers (first 4000). */
+static void spu_jobapi_log(spu_context* ctx, uint32_t pc, uint32_t tgt)
+{
+    static int s_on = -1; if (s_on < 0) s_on = getenv("SPU_JOBAPI_LOG") ? 1 : 0;
+    if (!s_on || pc < 0x4000u || tgt >= 0x4000u || !ctx->policy_mode) return;
+    static int s_wid = -2; if (s_wid == -2) { const char* w = getenv("SPU_JOBAPI_WID"); s_wid = w ? atoi(w) : -1; }
+    if (s_wid >= 0 && ctx->ls[0x1DF] != (unsigned)s_wid) return;
+    static long n; if (n++ >= 4000) return;
+    const uint8_t* m = ctx->ls + 0x4000;
+    fprintf(stderr, "[jobapi] wid=%u spu=%u mod=%02X%02X%02X%02X pc=0x%05X -> 0x%05X"
+                    " r3=%08X %08X r4=%08X %08X r5=%08X r6=%08X\n",
+            ctx->ls[0x1DF], ctx->ls[0x1CB], m[0], m[1], m[2], m[3], pc, tgt,
+            ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[1],
+            ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0]);
+}
+
 static int spu_step(spu_context* ctx) {
     uint32_t pc = ctx->pc, m = pc & SPU_LS_MASK;
     const uint8_t* p = ctx->ls;
@@ -302,7 +321,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_dftsv:  DST = spu_dftsv(A, (int32_t)(d.rb & 0x7F)); break;   /* I7 sits in the rb field */
     /* control flow */
     case SPU_br: case SPU_bra: next = d.tgt; break;
-    case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt;
+    case SPU_brsl: case SPU_brasl: spu_jobapi_log(ctx, pc, d.tgt); DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt;
         { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
     case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
@@ -317,7 +336,7 @@ static int spu_step(spu_context* ctx) {
     } while (0)
     case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
     case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
-        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
+        spu_jobapi_log(ctx, pc, tg); DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
         DST = spu_link((pc + 4) & 0x3FFFC);
         if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
