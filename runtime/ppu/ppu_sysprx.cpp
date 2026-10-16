@@ -17,6 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mutex>
+#include <set>
+#include <utility>
 /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
@@ -353,6 +356,20 @@ static void sys_lwcond_wait(ppu_context* ctx)
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
     HANDLE s = lwm_sem(lwmutex);
+    /* LWCOND_TRACE=1: the first wait of each (thread, lwcond): the paired
+     * lwmutex, its owner and recursion as the wait begins, and the caller. A
+     * thread that waits on a condition paired with one mutex while holding
+     * another starves whoever needs the other one. */
+    static const bool trace = getenv("LWCOND_TRACE") != nullptr;
+    if (trace) {
+        static std::mutex seen_lock;
+        static std::set<std::pair<uint32_t, uint32_t>> seen;
+        std::lock_guard<std::mutex> g(seen_lock);
+        if (seen.insert({(uint32_t)ctx->thread_id, lwcond}).second)
+            fprintf(stderr, "[LWCOND] tid=%u wait lwcond=0x%08X lwmutex=0x%08X owner=0x%08X recur=%u timeout=%llu lr=0x%08X\n",
+                    (unsigned)ctx->thread_id, lwcond, lwmutex, vm_read32(lwmutex + LWM_OWNER),
+                    vm_read32(lwmutex + LWM_RECUR), (unsigned long long)ctx->gpr[4], (uint32_t)ctx->lr);
+    }
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
