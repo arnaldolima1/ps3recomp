@@ -1070,6 +1070,21 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* An event flag made by the runtime itself (no guest attribute), its id
+ * written big-endian to id_out_ea: libspurs makes two for every
+ * CellSpursTaskset2 (cellSpursCreateTaskset2). */
+int64_t sys_event_flag_create_host(uint32_t id_out_ea, uint64_t init_pattern)
+{
+    ppu_context* c = (ppu_context*)calloc(1, sizeof(ppu_context));
+    if (!c) return (int64_t)(int32_t)CELL_ENOMEM;
+    c->gpr[3] = id_out_ea;
+    c->gpr[4] = 0;
+    c->gpr[5] = init_pattern;
+    int64_t rc = sys_event_flag_create(c);
+    free(c);
+    return rc;
+}
+
 int64_t sys_event_flag_destroy(ppu_context* ctx)
 {
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);

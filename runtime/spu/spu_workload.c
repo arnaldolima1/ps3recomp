@@ -391,20 +391,28 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
     ts_unlock();
 }
 
-static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+/* A task the PPU creates counts as running from the moment it is dispatched,
+ * not from when its host thread first runs: cellSpursCreateTask enables it
+ * and spawns the thread, and a sibling exiting in between used to find it
+ * enabled, pending and "not running" and start it a second time. God of War:
+ * Ascension creates five tasks that each claim one item with an atomic add
+ * and the one that sees the count runs the final step; three ran twice, the
+ * count overshot, and the PPU waited for that step for good (the loading
+ * screen froze). The scheduler below marks its own starts under the lock.
+ * on=0 takes the mark back when the dispatch did not happen. */
+void spu_taskset_set_running(uint32_t taskset_ea, uint32_t t, int on)
+{
+    spu_taskset_mark(taskset_ea, t, on);
+}
+
+/* Start every enabled task of one taskset that is ready or pending and not
+ * running here. Called under ts_lock. */
+static void ts_start_ready(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-    ts_lock();
     uint8_t* ts = vm_base + taskset_ea;
     uint8_t* run = ts_running(taskset_ea);
-    if (done_task < 128) {
-        uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
-        ts[0x10 + done_task / 8] &= (uint8_t)~m;
-        ts[0x20 + done_task / 8] &= (uint8_t)~m;
-        ts[0x30 + done_task / 8] &= (uint8_t)~m;
-        if (run) run[done_task / 8] &= (uint8_t)~m;
-    }
     for (uint32_t t = 0; t < 128 && run; t++) {
         uint8_t m = (uint8_t)(0x80u >> (t & 7));
         if (!(ts[0x30 + t / 8] & m) || (run[t / 8] & m)) continue;
@@ -427,6 +435,39 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
         spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
     }
+}
+
+/* Track a taskset from its creation, so a task an SPU creates in it is
+ * started even if no task of that taskset has run yet (below). */
+void spu_taskset_track(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    ts_lock();
+    (void)ts_running(taskset_ea);
+    ts_unlock();
+}
+
+static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+{
+    extern uint8_t* vm_base;
+    ts_lock();
+    uint8_t* ts = vm_base + taskset_ea;
+    uint8_t* run = ts_running(taskset_ea);
+    if (done_task < 128) {
+        uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
+        ts[0x10 + done_task / 8] &= (uint8_t)~m;
+        ts[0x20 + done_task / 8] &= (uint8_t)~m;
+        ts[0x30 + done_task / 8] &= (uint8_t)~m;
+        if (run) run[done_task / 8] &= (uint8_t)~m;
+    }
+    ts_start_ready(taskset_ea, done_task);
+    /* A task can create tasks in ANOTHER taskset before it exits (God of
+     * War: Ascension's particle tasks start their next phase in a sibling
+     * taskset whose tasks have never run), and nothing else would look at
+     * that one: scan every tracked taskset. */
+    for (int i = 0; i < TS_TRACK; i++)
+        if (s_ts_run[i].ea && s_ts_run[i].ea != taskset_ea)
+            ts_start_ready(s_ts_run[i].ea, done_task);
     ts_unlock();
 }
 

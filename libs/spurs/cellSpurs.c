@@ -942,6 +942,18 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
      * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
     spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
                        taskset_size, /*evf1*/0, /*evf2*/0);
+    /* A CellSpursTaskset2 carries two lv2 event flags, one bit per task, for
+     * task exit (cellSpursJoinTask2). The SPU task library will not create a
+     * task in a taskset whose flags are both 0 (CELL_SPURS_TASK_ERROR_PERM):
+     * make them, ids straight into the taskset. */
+    if (taskset_size == 0x2900u) {
+        extern int64_t sys_event_flag_create_host(uint32_t, uint64_t);
+        sys_event_flag_create_host(taskset_ea + CSTS_EVENT_FLAG_ID1, 0);
+        sys_event_flag_create_host(taskset_ea + CSTS_EVENT_FLAG_ID2, 0);
+    }
+    /* Known to the taskset scheduler from the start: an SPU may create its
+     * first tasks (spu_taskset_track). */
+    { extern void spu_taskset_track(uint32_t); spu_taskset_track(taskset_ea); }
     g_ydkj_real_taskset_ea = taskset_ea;
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
@@ -982,8 +994,15 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset,
         const u8* a = GUEST_PTR(attr, const u8*);
         for (int i = 0; i < 8; i++) args = (args << 8) | a[0x08 + i];
     }
-    printf("[cellSpurs] CreateTaskset2 -> CreateTaskset (arg=0x%016llX)\n", (unsigned long long)args);
-    return cellSpursCreateTaskset(spurs, taskset, args, NULL, 0);
+    printf("[cellSpurs] CreateTaskset2 (arg=0x%016llX, size 0x2900)\n", (unsigned long long)args);
+    /* A CellSpursTaskset2 is 0x2900 bytes, and its size field (+0x1890)
+     * says so: the SPU task library checks it before it creates a task in
+     * the taskset from an SPU (taskset size > 0x28FF, or
+     * CELL_SPURS_TASK_ERROR_PERM, 0x80410909). Made as a first-generation
+     * taskset, it read 0x1900, so God of War: Ascension's particle tasks
+     * could not start their next phase and the loading screen waited on
+     * it for good. */
+    return spurs_create_taskset(spurs, taskset, args, NULL, 0, 0x2900u);
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -1120,6 +1139,11 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             if (taskId) vm_write32((u32)(uintptr_t)taskId, i);
             (void)taskId_h;
 
+            /* Running before it is enabled: this call dispatches the task
+             * itself below, and a sibling exiting meanwhile must not find it
+             * enabled and idle and start it again (spu_taskset_set_running). */
+            extern void spu_taskset_set_running(uint32_t, uint32_t, int);
+            if (elf) spu_taskset_set_running(taskset_ea, i, 1);
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
@@ -1201,11 +1225,19 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
-                if (sz)
+                int started = 0;
+                if (sz) {
+                    /* The dispatch reads the task from these globals, and the
+                     * taskset scheduler (another thread) sets them for its own
+                     * starts: set them again right before. */
+                    g_ydkj_real_taskset_ea = taskset_ea;
+                    g_ydkj_real_taskid     = i;
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                    started = spu_workload_dispatch_async(host_elf, (uint32_t)sz,
+                                                          (uint32_t)(uintptr_t)context);
+                }
+                if (!started) spu_taskset_set_running(taskset_ea, i, 0);
             }
             return CELL_OK;
         }
