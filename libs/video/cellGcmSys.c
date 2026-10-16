@@ -800,6 +800,7 @@ unsigned long long ps3_ms_now(void)
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+static u32 s_report_ctx = 0;    /* NV4097_SET_CONTEXT_DMA_REPORT */
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
@@ -1975,12 +1976,33 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * area. Sample counts are not measured, so a ZPASS query
                      * reports "visible" -- the conservative answer; reading 0
                      * tells the title every queried object is occluded. */
+                    /* NV4097_SET_CONTEXT_DMA_REPORT: where GET_REPORT writes.
+                     * 0xFEED0001 (CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER) puts
+                     * the reports in main memory, at an IO offset. */
+                    if (m == 0x01A8) s_report_ctx = vm_read32(dea);
                     if (m == 0x1800) {
                         const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
                         { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
+                        const u64 ts = get_timestamp_ns();
+                        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
                         if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-                            s_report_data[idx].timestamp = get_timestamp_ns();
-                            s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                            s_report_data[idx].timestamp = ts;
+                            s_report_data[idx].value = val;
+                        }
+                        /* A main-memory report is what the title (and its SPU
+                         * jobs) actually read: CellGcmReportData, big-endian
+                         * {u64 timer; u32 value; u32 padding}. God of War:
+                         * Ascension times its frames with these and its
+                         * RsxSync jobs wait on them; kept only in the host
+                         * array above, they never changed. */
+                        if (s_report_ctx == 0xFEED0001u) {
+                            const u32 rea = gcm_io2ea(v & 0xFFFFF0u);
+                            if (rea) {
+                                vm_write32(rea + 0, (u32)(ts >> 32));
+                                vm_write32(rea + 4, (u32)ts);
+                                vm_write32(rea + 8, val);
+                                vm_write32(rea + 12, 0);
+                            }
                         }
                     }
                 } else

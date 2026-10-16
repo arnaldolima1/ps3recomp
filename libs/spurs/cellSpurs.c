@@ -429,7 +429,10 @@ enum {
     SPURS_SYSSRV_MSG   = 0xBD,
     SPURS_WKL_INFO1    = 0xB00,
     SPURS_WKL_INFO_SZ  = 0x20,
-    SPURS_WKL_INFO2    = 0x1200, /* wid 16-31 (CellSpurs2 only) */
+    SPURS_WKL_INFO2    = 0x1000, /* wid 16-31 (CellSpurs2 only); the Wws job
+                                  * module computes spurs + 0x1000 + 32*(wid-16) */
+    SPURS_FLAGS1       = 0x74,
+    SPURS_SF1_32_WORKLOADS = 0x40,
     /* CELL_SPURS_SIZE = 4096 (SDK cell/spurs/types.h). The 8192-byte variant
      * is CellSpurs2 (cellSpursInitialize*2* NIDs) which LBP does not use —
      * clearing 0x2000 here overran the game's 4KB heap block and corrupted
@@ -533,7 +536,13 @@ s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
         /* CellSpurs2 is 8 KB: the second workload set lives past 4 KB. */
         const u32 ea = (u32)(uintptr_t)spurs;
         struct SpursInst* si = spurs_inst_find(ea);
-        if (si) { si->is2 = 1; memset(vm_base + ea + SPURS_INST_SIZE, 0, SPURS_INST_SIZE); }
+        if (si) {
+            si->is2 = 1;
+            memset(vm_base + ea + SPURS_INST_SIZE, 0, SPURS_INST_SIZE);
+            /* flags1 says so to SPU code: the Wws job module tests it before
+             * it looks a wid >= 16 up, and takes its error path without it. */
+            *(vm_base + ea + SPURS_FLAGS1) |= SPURS_SF1_32_WORKLOADS;
+        }
     }
     return rc;
 }
