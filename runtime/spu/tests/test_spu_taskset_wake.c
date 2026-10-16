@@ -288,6 +288,8 @@ uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid = 0;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }
 void ydkj_wake_all_event_flags(void)                   { }
+int spurs_ready_level(void)                             { return 0; }
+uint32_t spurs_poll_select(uint32_t ea, uint32_t cur, uint32_t spu) { (void)ea; (void)cur; (void)spu; return 0x20; }
 void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
 {
     (void)c; (void)a; (void)b; (void)d;

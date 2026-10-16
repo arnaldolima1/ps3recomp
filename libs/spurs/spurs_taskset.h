@@ -76,17 +76,35 @@ static inline uint32_t spurs_taskset_taskinfo_ea(uint32_t taskset_ea, uint32_t t
 
 /* set/clear/test a task bit in a 128-bit bitset (bit 0 = MSB of word 0, per RPCS3
  * atomic_tasks_bitset::get_bit). bitset_ea = taskset_ea + CSTS_READY etc. */
-static inline void spurs_bitset_set(uint32_t bitset_ea, uint32_t taskId)
+/* The bitsets share a 128-byte line with the rest of the taskset, which the
+ * SPU task library updates with GETLLAR/PUTLLC (cellSpursSendSignal sets a
+ * bit in CSTS_SIGNALLED that way). The host's read-modify-write must hold the
+ * lock-line lock for its whole span, and break the reservations on the line,
+ * or the two undo each other: a task clearing its consumed signal while
+ * another task's signal was being committed wiped that one too. God of War:
+ * Ascension's RsxSync signals its five post-process tasks back to back; two
+ * of them slept through the round, its dependency never reached zero and the
+ * frames stopped. Raw accesses inside: vm_write32 would take the same
+ * (non-recursive) lock. */
+static inline void spurs_bitset_rmw(uint32_t bitset_ea, uint32_t taskId, int set)
 {
     uint32_t word_ea = bitset_ea + (taskId / 32) * 4;
     uint32_t mask = (1u << 31) >> (taskId % 32);
-    vm_write32(word_ea, vm_read32(word_ea) | mask);
+    spu_lockline_lock();
+    uint8_t* p = vm_ptr8(word_ea);
+    uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    v = set ? (v | mask) : (v & ~mask);
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+    if (spu_coh_is_reserved(word_ea)) spu_coh_notify_write(word_ea);
+    spu_lockline_unlock();
+}
+static inline void spurs_bitset_set(uint32_t bitset_ea, uint32_t taskId)
+{
+    spurs_bitset_rmw(bitset_ea, taskId, 1);
 }
 static inline void spurs_bitset_clear(uint32_t bitset_ea, uint32_t taskId)
 {
-    uint32_t word_ea = bitset_ea + (taskId / 32) * 4;
-    uint32_t mask = (1u << 31) >> (taskId % 32);
-    vm_write32(word_ea, vm_read32(word_ea) & ~mask);
+    spurs_bitset_rmw(bitset_ea, taskId, 0);
 }
 static inline int spurs_bitset_test(uint32_t bitset_ea, uint32_t taskId)
 {
