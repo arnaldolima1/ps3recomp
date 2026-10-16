@@ -828,6 +828,18 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 /* How long a self-JUMP park may stand with `put` somewhere else before the
  * drain gives up on it being patched and follows `put` instead. */
 #define GCM_PARK_GRACE_MS 50ull
+/* GCM_PARK_WAIT_MS=<ms> overrides it. God of War: Ascension moves `put` to the
+ * end of a frame its SPU jobs are still filling and only then patches the park
+ * into a JUMP to it; recompiled, those jobs take far longer than 50 ms, and
+ * following put early skips the frame, the user command that releases the
+ * render thread's frame slot with it. */
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static unsigned long long ms = ~0ull;
+    if (ms == ~0ull) { const char* e = getenv("GCM_PARK_WAIT_MS");
+                       ms = e ? strtoull(e, NULL, 0) : GCM_PARK_GRACE_MS; }
+    return ms;
+}
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1793,7 +1805,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= gcm_park_grace_ms()) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
