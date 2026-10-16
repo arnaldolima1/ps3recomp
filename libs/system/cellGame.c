@@ -762,6 +762,17 @@ s32 cellGameGetSizeKB(s32* sizeKB)
     return CELL_OK;
 }
 
+/* cellGamePatchCheck(CellGameContentSize* size, void* reserved): is the title
+ * running from an installed patch? A disc boot is not, and says so with
+ * NOTPATCH, as the boot check already reports a disc (type 1). God of War:
+ * Ascension (BCES01741) asks it at boot; unregistered, it had a faked answer. */
+s32 cellGamePatchCheck(void* size, void* reserved)
+{
+    (void)size; (void)reserved;
+    printf("[cellGame] PatchCheck() -> NOTPATCH (a disc boot)\n");
+    return CELL_GAME_ERROR_NOTPATCH;
+}
+
 s32 cellGameGetLocalWebContentPath(char* path)
 {
     printf("[cellGame] GetLocalWebContentPath()\n");

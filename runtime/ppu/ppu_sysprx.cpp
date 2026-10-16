@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mutex>
+#include <set>
+#include <utility>
 /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
@@ -327,15 +330,33 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
  * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
  * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
- * +0x08 lwcond_queue id. */
+ * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes, as
+ * libs/system/sysPrxForUser.h has it: +0x00 the lwmutex EA (be32), +0x04 the
+ * lwcond_queue id.
+ *
+ * It was written as a 64-bit EA at +0x00 and the id at +0x08: the first word
+ * was then always 0 and the id landed past the structure, on whatever the
+ * guest keeps after it. God of War: Ascension (BCES01741) reads that first
+ * word before waiting and, finding 0, never waited: its FIOS threads span
+ * forever holding the lwmutex their siblings needed, and no file was ever
+ * opened. PS3_LWCOND_LAYOUT64=1 restores the old layout, for comparison. */
+static bool lwcond_layout64()
+{
+    static const bool old = getenv("PS3_LWCOND_LAYOUT64") != nullptr;
+    return old;
+}
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
-    vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
-    vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    if (lwcond_layout64()) {
+        vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
+        vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    } else {
+        vm_write32(lwcond + 0x00, lwmutex);
+        vm_write32(lwcond + 0x04, ++s_lwcond_id);
+    }
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
@@ -349,8 +370,22 @@ static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
+    uint32_t lwmutex = lwcond_layout64() ? (uint32_t)vm_read64(lwcond + 0x00) : vm_read32(lwcond + 0x00);
     HANDLE s = lwm_sem(lwmutex);
+    /* LWCOND_TRACE=1: the first wait of each (thread, lwcond): the paired
+     * lwmutex, its owner and recursion as the wait begins, and the caller. A
+     * thread that waits on a condition paired with one mutex while holding
+     * another starves whoever needs the other one. */
+    static const bool trace = getenv("LWCOND_TRACE") != nullptr;
+    if (trace) {
+        static std::mutex seen_lock;
+        static std::set<std::pair<uint32_t, uint32_t>> seen;
+        std::lock_guard<std::mutex> g(seen_lock);
+        if (seen.insert({(uint32_t)ctx->thread_id, lwcond}).second)
+            fprintf(stderr, "[LWCOND] tid=%u wait lwcond=0x%08X lwmutex=0x%08X owner=0x%08X recur=%u timeout=%llu lr=0x%08X\n",
+                    (unsigned)ctx->thread_id, lwcond, lwmutex, vm_read32(lwmutex + LWM_OWNER),
+                    vm_read32(lwmutex + LWM_RECUR), (unsigned long long)ctx->gpr[4], (uint32_t)ctx->lr);
+    }
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);

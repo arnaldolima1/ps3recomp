@@ -171,6 +171,7 @@ s32 cellGameDeleteGameData(const char* dirName);
 /* cellGameSetExitParam — see cellGameExec.h for correct signature */
 
 s32 cellGameGetSizeKB(s32* sizeKB);
+s32 cellGamePatchCheck(void* size, void* reserved);
 
 s32 cellGameGetLocalWebContentPath(char* path);
 
