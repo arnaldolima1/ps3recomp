@@ -2140,6 +2140,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_report_data[idx].timestamp = ts;
                             s_report_data[idx].value = val;
                         }
+                        /* SPU code polls these reports (a Wws job list's RSX
+                         * barrier): let the SPURS kernel look again now. */
+                        { extern void spurs_external_event(void); spurs_external_event(); }
                     }
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));

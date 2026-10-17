@@ -1162,6 +1162,13 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
     static _Thread_local unsigned long long s_wait_exit_ms;
+    /* SPU_TASK_TIMELOG=1: every WAIT_SIGNAL enter and exit with t=<us> on the
+     * clock of [atom-ea]/[ww]/[GET_REPORT] (tools/frame_timeline.py). */
+    static int s_ttl = -1;
+    if (s_ttl < 0) s_ttl = getenv("SPU_TASK_TIMELOG") ? 1 : 0;
+    if (s_ttl) { extern unsigned long long ps3_qpc_us(void);
+        fprintf(stderr, "[task-time] t=%lluus enter task=%u taskset=0x%08X\n",
+                ps3_qpc_us(), taskId, taskset_ea); }
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
       static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
@@ -1246,6 +1253,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     s_task_out = 1; __atomic_fetch_add(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL);
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
+    if (s_ttl) { extern unsigned long long ps3_qpc_us(void);
+        fprintf(stderr, "[task-time] t=%lluus exit task=%u taskset=0x%08X\n",
+                ps3_qpc_us(), taskId, taskset_ea); }
     { static int _x = -1; if (_x < 0) _x = getenv("SPU_WAITSIG_EXITLOG") ? 1 : 0;
       if (_x) fprintf(stderr, "[spu_workload] WAIT_SIGNAL exit task=%u taskset=0x%08X t=%llu\n",
                       taskId, taskset_ea, (unsigned long long)s_wait_exit_ms); }

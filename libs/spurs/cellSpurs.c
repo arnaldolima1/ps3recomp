@@ -491,6 +491,36 @@ static u32 wkl_maxcont(u32 ea, u32 wid)
 static void wkl_curcont_set(u32 ea, u32 wid, u8 v)
 { if (wid < 16) vm_base[ea + SPURS_WKL_CURCONT + wid] = v; }
 
+/* Something a workload may be polling for happened outside SPURS (the RSX
+ * wrote a report). A workload that ran and found nothing to do is backed off
+ * (idle[], up to 2^4 kernel passes, ~16 ms), and no readyCount or signal
+ * changes when the GPU writes, so a Wws job list waiting at a kRsxBarrier only
+ * saw the report at its next back-off slot: God of War: Ascension's RsxSync
+ * reacted to a frame's report up to ~17 ms late, and the frame missed its
+ * vblank. Clear the back-off and wake the kernel. Called from the GPU thread,
+ * sometimes under the FIFO lock, so it takes no lock: the back-off bytes are a
+ * heuristic (a racing increment only delays one admission, as before), and a
+ * condition variable may be woken without its lock. */
+void spurs_external_event(void)
+{
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        struct SpursInst* si = &s_inst[i];
+        if (!__atomic_load_n(&si->ea, __ATOMIC_ACQUIRE)) continue;
+        for (u32 w = 0; w < SPURS_MAX_WID; w++)
+            __atomic_store_n(&si->idle[w], (u8)0, __ATOMIC_RELAXED);
+        WakeAllConditionVariable(&si->wake);
+    }
+}
+
+/* SPURS_IDLE_BACKOFF_MAX=<n>: the back-off cap, 2^n kernel passes (default 4). */
+static u8 spurs_idle_backoff_max(void)
+{
+    static int s_max = -1;
+    if (s_max < 0) { const char* e = getenv("SPURS_IDLE_BACKOFF_MAX"); s_max = e ? atoi(e) : 4;
+                     if (s_max < 0) s_max = 0; if (s_max > 7) s_max = 7; }
+    return (u8)s_max;
+}
+
 static struct SpursInst* spurs_inst_find(u32 ea)
 {
     for (int i = 0; i < MAX_SPURS_INST; i++)
@@ -1886,7 +1916,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         wkl_curcont_set(slot->ea, wid, si->active[wid]);
         ef_line_end(slot->ea);
         if (polls) si->idle[wid] = 0;
-        else if (si->idle[wid] < 4) si->idle[wid]++;
+        else if (si->idle[wid] < spurs_idle_backoff_max()) si->idle[wid]++;
         slot->busy = 0;
         WakeAllConditionVariable(&si->wake);
     }

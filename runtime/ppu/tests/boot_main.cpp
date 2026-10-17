@@ -513,9 +513,25 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * fence still paid the whole tick. Waiting on it keeps the same 4 ms
          * ceiling when nothing kicks, and drains on demand when something
          * does. */
-        { /* at most 4 ms, and no later than the next vblank */
-          const double rem_ms = (next_tick_us - (double)ps3_qpc_us()) / 1000.0;
-          cellGcm_fifo_kick_wait(rem_ms <= 0.0 ? 0u : rem_ms >= 4.0 ? 4u : (unsigned)rem_ms); }
+        { /* At most GCM_WALK_POLL_US (default 4000), and no later than the next
+           * vblank. The FIFO walker below only runs again when this returns: a
+           * kick (a guest thread's dry fence wait) ends it early, but nothing
+           * kicks when the PPU moves `put` or an SPU releases a semaphore the
+           * GPU waits on, so each GPU<->SPU hand-off in a frame waited up to
+           * the whole poll. Under 1 ms it spins, yielding, instead of sleeping
+           * (a sleep cannot be shorter than the 1 ms timer period). */
+          static double s_poll_us = -1.0;
+          if (s_poll_us < 0.0) { const char* e = getenv("GCM_WALK_POLL_US");
+                                 s_poll_us = e ? atof(e) : 4000.0;
+                                 if (s_poll_us < 0.0) s_poll_us = 0.0; }
+          const double t_us = (double)ps3_qpc_us();
+          double w_us = next_tick_us - t_us;
+          if (w_us > s_poll_us) w_us = s_poll_us;
+          if (w_us >= 1000.0) cellGcm_fifo_kick_wait((unsigned)(w_us / 1000.0));
+          else {
+              const double end = t_us + (w_us > 0.0 ? w_us : 0.0);
+              do { cellGcm_fifo_kick_wait(0); SwitchToThread(); } while ((double)ps3_qpc_us() < end);
+          } }
         ULONGLONG now = GetTickCount64();
         const double now_us = (double)ps3_qpc_us();
         int fired = 0;
