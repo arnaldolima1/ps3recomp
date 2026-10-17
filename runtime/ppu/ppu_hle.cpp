@@ -81,6 +81,7 @@ void vm_write64(uint64_t addr, uint64_t val);
  * host AV inside an HLE handler names the culprit NID/function. */
 extern "C" uint32_t    g_last_hle_nid  = 0;
 extern "C" const char* g_last_hle_name = "";
+extern "C" unsigned long long ps3_qpc_us(void);   /* cellGcmSys.c: PS3_HLE_HIST */
 
 /* Which HLE each guest thread is currently INSIDE, indexed by ctx->thread_id.
  *
@@ -729,6 +730,32 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    /* PS3_HLE_HIST=<seconds>: the most called imports over each window, by
+     * name -- which clock a title's movie player reads, what a frame calls.
+     * Counts are unsynchronised (a lost increment does not change the top). */
+    { static long s_hh = -1;
+      if (s_hh < 0) { const char* hv = getenv("PS3_HLE_HIST"); s_hh = hv ? atol(hv) : 0; }
+      if (s_hh > 0) {
+          enum { HH = 512 };
+          static uint32_t hk[HH]; static const char* hn[HH]; static unsigned long hc[HH];
+          static unsigned long long t0;
+          unsigned slot = (nid * 2654435761u) >> 23;              /* 9 bits */
+          for (unsigned p = 0; p < HH; p++, slot = (slot + 1) & (HH - 1))
+              if (hk[slot] == nid || !hk[slot]) { hk[slot] = nid; hn[slot] = e->name; hc[slot]++; break; }
+          const unsigned long long now = ps3_qpc_us();
+          if (!t0) t0 = now;
+          if (now - t0 >= (unsigned long long)s_hh * 1000000ull) {
+              t0 = now;
+              fprintf(stderr, "--- HLE calls (last %lds) ---\n", s_hh);
+              for (int r = 0; r < 20; r++) {
+                  int best = -1;
+                  for (int k = 0; k < HH; k++) if (hc[k] && (best < 0 || hc[k] > hc[best])) best = k;
+                  if (best < 0) break;
+                  fprintf(stderr, "  %8lu  %s\n", hc[best], hn[best] ? hn[best] : "?");
+                  hc[best] = 0;
+              }
+              for (int k = 0; k < HH; k++) hc[k] = 0;
+          } } }
     ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }

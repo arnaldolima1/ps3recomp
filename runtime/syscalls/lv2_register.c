@@ -2589,6 +2589,29 @@ int lv2_try_syscall(ppu_context* ctx)
     /* YDKJ diag: full event-syscall trace (#128..141) during SPURS init to find
      * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
     uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
+    /* LV2_SYSCALL_HIST=<seconds>: the most called syscalls over each window
+     * (sys_time_get_system_time is 145, sys_timer_usleep 141). Unsynchronised
+     * counts, like PS3_HLE_HIST. */
+    { static long s_sh = -1;
+      if (s_sh < 0) { const char* e = getenv("LV2_SYSCALL_HIST"); s_sh = e ? atol(e) : 0; }
+      if (s_sh > 0) {
+          static unsigned long cnt[LV2_SYSCALL_MAX]; static unsigned long long t0;
+          extern unsigned long long ps3_qpc_us(void);
+          cnt[num]++;
+          const unsigned long long now = ps3_qpc_us();
+          if (!t0) t0 = now;
+          if (now - t0 >= (unsigned long long)s_sh * 1000000ull) {
+              t0 = now;
+              fprintf(stderr, "--- lv2 syscalls (last %lds) ---\n", s_sh);
+              for (int r = 0; r < 12; r++) {
+                  int best = -1;
+                  for (int k = 0; k < LV2_SYSCALL_MAX; k++) if (cnt[k] && (best < 0 || cnt[k] > cnt[best])) best = k;
+                  if (best < 0) break;
+                  fprintf(stderr, "  %8lu  syscall %d\n", cnt[best], best);
+                  cnt[best] = 0;
+              }
+              for (int k = 0; k < LV2_SYSCALL_MAX; k++) cnt[k] = 0;
+          } } }
     ctx->gpr[3] = (uint64_t)h(ctx);
     /* LV2_ERRDBG=1: every syscall that returns non-OK, deduped by (number,
      * result). A guest that asserts on a result once per frame is easier to

@@ -305,6 +305,10 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
            (unsigned long long)au.pts);
 
     if (v->ff) {
+        { static int s_tl = -1; if (s_tl < 0) s_tl = getenv("VDEC_TIMELOG") ? 1 : 0;
+          if (s_tl) { extern unsigned long long ps3_qpc_us(void);
+              printf("[vdec-au] t=%lluus size=%u pts=%llu queued=%u%s\n", ps3_qpc_us(), au.size,
+                     (unsigned long long)au.pts, v->qCount, v->qCount >= VDEC_BUSY_AT ? " BUSY" : ""); } }
         if (v->qCount >= VDEC_BUSY_AT)
             return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
         v->auCount++;
@@ -441,6 +445,12 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
                      n, handle, v->qCount, q->item.auNum,
                      (unsigned long long)q->item.pts, q->pictType);
           n++; }
+        /* VDEC_TIMELOG=1: every GetPicItem with the time, to set the rate the
+         * title takes pictures at against the stream's frame period. */
+        { static int s_tl = -1; if (s_tl < 0) s_tl = getenv("VDEC_TIMELOG") ? 1 : 0;
+          if (s_tl) { extern unsigned long long ps3_qpc_us(void);
+              printf("[vdec-time] t=%lluus pts=%llu queued=%u\n", ps3_qpc_us(),
+                     (unsigned long long)q->item.pts, v->qCount); } }
         vdec_write_item(handle, &q->item);
         vdec_write_pic_type(handle, q);
         vm_write32(out, VDEC_ITEM_EA(handle));

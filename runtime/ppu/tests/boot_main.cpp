@@ -449,6 +449,17 @@ static DWORD WINAPI guest_prof_thread(LPVOID)
 
 extern "C" const char* cellGame_get_title(void);   /* PARAM.SFO TITLE, for the caption */
 
+extern "C" unsigned long long ps3_qpc_us(void);   /* cellGcmSys.c */
+
+/* The vblank period in microseconds. PS3_VBLANK_HZ overrides the 59.94 Hz of
+ * NTSC/720p (1001/60 ms). */
+static double vblank_period_us(void)
+{
+    double hz = 60000.0 / 1001.0;
+    if (const char* e = getenv("PS3_VBLANK_HZ")) { double v = atof(e); if (v >= 10.0 && v <= 240.0) hz = v; }
+    return 1e6 / hz;
+}
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     /* Window caption: $PS3_TITLE wins, else the TITLE field PARAM.SFO already
@@ -488,17 +499,27 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * window DXGI Present throttles hard, which previously stalled these ticks and
      * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
      * and catch up in a bounded burst so present latency never slows the game. */
-    ULONGLONG next_tick = GetTickCount64();
+    /* On the QPC clock at the real vblank period. It was GetTickCount64, which
+     * moves in ~15.6 ms steps, with a 16 ms period (62.5 Hz): vblanks came in
+     * bursts, two at once or none for a step, and a title pacing its movie at
+     * two vblanks per picture (God of War: Ascension's cinematic) took a new
+     * picture in only ~60% of its frames and played the video slow against
+     * its audio. */
+    const double vblank_us = vblank_period_us();
+    double next_tick_us = (double)ps3_qpc_us();
     for (;;) {
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
          * fence still paid the whole tick. Waiting on it keeps the same 4 ms
          * ceiling when nothing kicks, and drains on demand when something
          * does. */
-        cellGcm_fifo_kick_wait(4);
+        { /* at most 4 ms, and no later than the next vblank */
+          const double rem_ms = (next_tick_us - (double)ps3_qpc_us()) / 1000.0;
+          cellGcm_fifo_kick_wait(rem_ms <= 0.0 ? 0u : rem_ms >= 4.0 ? 4u : (unsigned)rem_ms); }
         ULONGLONG now = GetTickCount64();
+        const double now_us = (double)ps3_qpc_us();
         int fired = 0;
-        while ((long long)(now - next_tick) >= 0 && fired < 240) {
+        while (now_us >= next_tick_us && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
             /* Present a pending flip BEFORE draining further: the flip fires
@@ -517,10 +538,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * Doing it here (not after present) keeps those fences advancing at 60Hz
              * even when present() throttles on a hidden/occluded window. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;                 /* ~60 Hz */
+            next_tick_us += vblank_us;
             fired++;
         }
-        if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
+        if (fired >= 240) next_tick_us = now_us;   /* fell too far behind -> resync */
         /* Drain at the outer ~4ms cadence too (not just the 16ms tick):
          * titles fence EVERY render pass on an RSX label the drain writes;
          * at 16ms per fence wave's six passes paced the guest to ~7 fps.

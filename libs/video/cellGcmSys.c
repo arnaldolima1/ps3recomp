@@ -748,9 +748,25 @@ void ppu_gcm_pump(void)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
                            calls, nv, nf, s_vblank_count, 10); } }
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+        /* One call per vblank, not one per pump: the pending bit folds every
+         * vblank since the last pump into one, and the pump only runs when a
+         * guest thread passes through it. A handler that counts its calls
+         * then loses time -- God of War: Ascension's movie clock ran at ~75%
+         * while its main thread spun on SPU job counters, and the cinematic
+         * fell behind its audio. A backlog past 8 (a long stall) is cut short
+         * rather than replayed as a burst. GCM_VBLANK_COALESCE=1: the old way. */
+        static int s_coalesce = -1;
+        if (s_coalesce < 0) s_coalesce = getenv("GCM_VBLANK_COALESCE") ? 1 : 0;
+        static u32 s_vblank_delivered;
+        const u32 now = s_vblank_count;
+        if (s_coalesce || now - s_vblank_delivered > 8u || s_vblank_delivered == 0)
+            s_vblank_delivered = now - 1u;
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
-                           0, 0, 0, 0, 0, 0, 0);
+        while ((s32)(now - s_vblank_delivered) > 0) {
+            s_vblank_delivered++;
+            g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_delivered,
+                               0, 0, 0, 0, 0, 0, 0);
+        }
     }
     if (p & 2) {
         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
@@ -3337,6 +3353,9 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 /* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
+    /* VDEC_TIMELOG=1 (with cellVdec's lines): when the title queues each flip. */
+    { static int s_tl = -1; if (s_tl < 0) s_tl = getenv("VDEC_TIMELOG") ? 1 : 0;
+      if (s_tl) printf("[flip-time] t=%lluus buffer=%u\n", ps3_qpc_us(), bufferId); }
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
         return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);
