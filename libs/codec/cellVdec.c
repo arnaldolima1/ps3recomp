@@ -26,6 +26,7 @@
 #define VDEC_QUEUE   32   /* decoded pictures waiting for GetPicture */
 #define VDEC_BUSY_AT 16   /* refuse new AUs past this many (EndSeq can add more) */
 #define VDEC_AU_RING 64   /* AUs remembered for pictures that come out late */
+#define VDEC_PEND     4   /* AUs taken while the picture queue is full (cmdDepth) */
 
 /* A decoded picture waiting for the title (decoder path only). */
 typedef struct {
@@ -56,12 +57,19 @@ typedef struct {
     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
     u32 newPics;        /* pictures queued by the current decode call */
     u64 nextPts;        /* timestamp for the next picture whose AU had none */
+    /* AUs accepted while the picture queue was full, decoded (and AUDONE
+     * sent) as the title takes pictures, the way the real decoder holds an
+     * AU it has no output buffer for. */
+    CellVdecAuInfo pend[VDEC_PEND];
+    u32 pendHead, pendCount;
+    int pumping;        /* vdec_pump running (a callback may call back in) */
 } VdecSlot;
 
 /* CODEC_TS_INVALID: both halves of the AU's pts/dts all ones. */
 #define VDEC_TS_INVALID 0xFFFFFFFFFFFFFFFFull
 
 static VdecSlot s_vdec[MAX_VDEC];
+static void vdec_decode_now(CellVdecHandle handle, const CellVdecAuInfo* au);
 
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
  * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
@@ -252,6 +260,7 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
         /* A new sequence: nothing from the last one is shown. */
         vdec_ff_reset(s_vdec[handle].ff);
         vdec_queue_clear(&s_vdec[handle]);
+        s_vdec[handle].pendHead = s_vdec[handle].pendCount = 0;
     }
     return CELL_OK;
 }
@@ -266,8 +275,15 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
     s_vdec[handle].seqStarted = 0;
 
     /* Pictures the decoder still holds for reordering come out now, each
-     * with its PICOUT, before SEQDONE. */
+     * with its PICOUT, before SEQDONE; held AUs are decoded first. */
     if (s_vdec[handle].ff) {
+        VdecSlot* v = &s_vdec[handle];
+        while (v->pendCount) {
+            const CellVdecAuInfo au = v->pend[v->pendHead];
+            v->pendHead = (v->pendHead + 1) % VDEC_PEND;
+            v->pendCount--;
+            vdec_decode_now(handle, &au);
+        }
         vdec_ff_drain(s_vdec[handle].ff, vdec_on_picture, &s_vdec[handle]);
         vdec_notify_new_pics(handle);
     }
@@ -276,6 +292,36 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
     vdec_notify(handle, CELL_VDEC_MSG_TYPE_SEQDONE, CELL_OK);
 
     return CELL_OK;
+}
+
+/* Decode one AU now: its pictures are queued, then AUDONE and a PICOUT for
+ * each. */
+static void vdec_decode_now(CellVdecHandle handle, const CellVdecAuInfo* au)
+{
+    VdecSlot* v = &s_vdec[handle];
+    v->auCount++;
+    v->aus[v->auCount % VDEC_AU_RING] = *au;
+    v->newPics = 0;
+    if (au->size)   /* an empty packet would mean end of stream to FFmpeg */
+        vdec_ff_decode(v->ff, vm_ptr8(au->startAddr), au->size, v->auCount,
+                       vdec_on_picture, v);
+    vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
+    vdec_notify_new_pics(handle);
+}
+
+/* Decode the held AUs the picture queue now has room for. */
+static void vdec_pump(CellVdecHandle handle)
+{
+    VdecSlot* v = &s_vdec[handle];
+    if (!v->ff || v->pumping) return;
+    v->pumping = 1;
+    while (v->pendCount && v->qCount < VDEC_BUSY_AT) {
+        const CellVdecAuInfo au = v->pend[v->pendHead];
+        v->pendHead = (v->pendHead + 1) % VDEC_PEND;
+        v->pendCount--;
+        vdec_decode_now(handle, &au);
+    }
+    v->pumping = 0;
 }
 
 s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auInfo)
@@ -308,17 +354,23 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
         { static int s_tl = -1; if (s_tl < 0) s_tl = getenv("VDEC_TIMELOG") ? 1 : 0;
           if (s_tl) { extern unsigned long long ps3_qpc_us(void);
               printf("[vdec-au] t=%lluus size=%u pts=%llu queued=%u%s\n", ps3_qpc_us(), au.size,
-                     (unsigned long long)au.pts, v->qCount, v->qCount >= VDEC_BUSY_AT ? " BUSY" : ""); } }
-        if (v->qCount >= VDEC_BUSY_AT)
-            return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
-        v->auCount++;
-        v->aus[v->auCount % VDEC_AU_RING] = au;
-        v->newPics = 0;
-        if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
-            vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
-                           vdec_on_picture, v);
-        vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
-        vdec_notify_new_pics(handle);
+                     (unsigned long long)au.pts, v->qCount, (v->pendCount || v->qCount >= VDEC_BUSY_AT) ? " HELD" : ""); } }
+        /* A full picture queue does not refuse the AU: the real decoder
+         * takes it and sends AUDONE once it has decoded it, which is after
+         * the title has taken pictures. Refused, God of War: Ascension's
+         * player waited for an AUDONE that never came, gave up after a
+         * second and then raced the movie to catch up. BUSY only past
+         * cmdDepth AUs held, which a title that waits for AUDONE never
+         * reaches. */
+        vdec_pump(handle);
+        if (v->pendCount || v->qCount >= VDEC_BUSY_AT) {
+            if (v->pendCount >= VDEC_PEND)
+                return (s32)CELL_VDEC_ERROR_BUSY;
+            v->pend[(v->pendHead + v->pendCount) % VDEC_PEND] = au;
+            v->pendCount++;
+            return CELL_OK;
+        }
+        vdec_decode_now(handle, &au);
         return CELL_OK;
     }
 
@@ -503,9 +555,12 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
-    if (v->ff)
-        return vdec_take_picture(v, dst, vm_read32(fmt_ea + 0),
-                                 vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
+    if (v->ff) {
+        const s32 r = vdec_take_picture(v, dst, vm_read32(fmt_ea + 0),
+                                        vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
+        if (r == CELL_OK) vdec_pump(handle);
+        return r;
+    }
     if (!v->hasPic)
         return (s32)CELL_VDEC_ERROR_EMPTY;
     v->hasPic = 0;
@@ -552,8 +607,10 @@ s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
         return CELL_OK;
     if (!fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
-    return vdec_take_picture(&s_vdec[handle], dst, vm_read32(fmt_ea + 0),
-                             vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));
+    const s32 r = vdec_take_picture(&s_vdec[handle], dst, vm_read32(fmt_ea + 0),
+                                    vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));
+    if (r == CELL_OK) vdec_pump(handle);
+    return r;
 }
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)

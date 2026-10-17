@@ -706,6 +706,17 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 static u32 s_fifo_getoff;   /* tentative: defined below */
 /* The park the walker last stopped on (GCM_PARK_SPU_HOLD_MS), ~0 = none. */
 static u32 s_last_park_off = ~0u;
+/* Every place the walker has parked. The title reuses the same few park
+ * words frame after frame; when its CPU side is quick enough to patch one
+ * before the walker gets there, the walker never parks on it, and the hold
+ * has to recognise it by its address. */
+#define GCM_PARK_SITES 16
+static u32 s_park_sites[GCM_PARK_SITES]; static unsigned s_park_sites_n;
+static int gcm_is_park_site(u32 off)
+{
+    for (unsigned i = 0; i < s_park_sites_n; i++) if (s_park_sites[i] == off) return 1;
+    return 0;
+}
 
 void cellGcm_request_tick(void)
 {
@@ -1554,6 +1565,13 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     else    Sleep(ms);
 }
 
+/* Wake the present thread's walker now (a wait it stopped on may be over:
+ * the SPURS tasks a held report waits for have gone back to WAIT_SIGNAL). */
+void cellGcm_fifo_kick(void)
+{
+    if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+}
+
 
 /* Serializes fence publication between the present ticker and every guest
  * thread poll-reading the ref register (REFPOLL default-on made this path
@@ -1830,6 +1848,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       }
                   }
                   s_last_park_off = s_fifo_getoff;
+                  if (!gcm_is_park_site(s_fifo_getoff))
+                      s_park_sites[s_park_sites_n++ % GCM_PARK_SITES] = s_fifo_getoff;
+                  if (s_park_sites_n > GCM_PARK_SITES) s_park_sites_n = GCM_PARK_SITES;
                   why = "parked";
                   break;
               }
@@ -1843,7 +1864,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * first frame and relies on that time: RsxSync's signal for
                * round 2 was eaten by tasks still in round 1's barriers. Off
                * by default. */
-              if (s_fifo_getoff == s_last_park_off) {
+              if (s_fifo_getoff == s_last_park_off || gcm_is_park_site(s_fifo_getoff)) {
                   static long hold = -1; static unsigned long long held_since;
                   if (hold < 0) { const char* e = getenv("GCM_PARK_SPU_HOLD_MS"); hold = e ? atol(e) : 0; }
                   extern long spu_taskset_tasks_running(void) __attribute__((weak));
@@ -1853,6 +1874,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       if (!held_since) held_since = now;
                       if (now - held_since < (unsigned long long)hold) { why = "spu-hold"; break; }
                   }
+                  { static int lg = -1; if (lg < 0) lg = getenv("GCM_HOLD_LOG") ? 1 : 0;
+                    if (lg) { extern unsigned long long ps3_qpc_us(void);
+                      fprintf(stderr, "[gcm-hold] t=%lluus park=0x%X parked=%d held=%llums\n",
+                              ps3_qpc_us(), s_fifo_getoff, s_fifo_getoff == s_last_park_off,
+                              held_since ? ps3_ms_now() - held_since : 0ull); } }
                   held_since = 0;
                   s_last_park_off = ~0u;
               }
@@ -1958,6 +1984,37 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     const unsigned long long now = ps3_ms_now();
                     if (last_flip && now - last_flip < (unsigned long long)pace) { why = "flip-pace"; break; }
                     last_flip = now;
+                }
+            }
+            /* GCM_REPORT_SPU_HOLD_MS=<ms>: a GET_REPORT waits, for up to <ms>,
+             * while SPURS tasks are out of WAIT_SIGNAL or still have a signal
+             * they have not picked up. A title that turns reports into task
+             * signals (God of War: Ascension's RsxSync job signals its
+             * post-process taskset once per report) counts on the RSX taking
+             * a frame's time between two of them; this one takes none, and
+             * when the PPU side is quick the next report lands while the
+             * tasks are still in the last round's barriers, which eat the
+             * signal: the round never ends and the GPU waits on its label
+             * forever. Like a blocked ACQUIRE, the pass stops before the
+             * method and the next pass re-reads it. Off by default. */
+            if (subch == 0 && (type == 0 ? (method <= 0x1800u && 0x1800u < method + count * 4u)
+                                         : method == 0x1800u)) {
+                static long rhold = -1; static unsigned long long rheld_since; static unsigned long rheld_n;
+                if (rhold < 0) { const char* e = getenv("GCM_REPORT_SPU_HOLD_MS"); rhold = e ? atol(e) : 0; }
+                extern long spu_taskset_tasks_running(void) __attribute__((weak));
+                if (rhold > 0) {
+                    /* QPC, not ps3_ms_now: GetTickCount64 steps by ~15.6 ms,
+                     * which is a frame. */
+                    const unsigned long long now = ps3_qpc_us();
+                    if (spu_taskset_tasks_running && spu_taskset_tasks_running() > 0) {
+                        if (!rheld_since) rheld_since = now;
+                        if (now - rheld_since < (unsigned long long)rhold * 1000ull) { why = "report-hold"; break; }
+                    }
+                    { static int lg = -1; if (lg < 0) lg = getenv("GCM_HOLD_LOG") ? 1 : 0;
+                      if (lg && rheld_since)
+                        fprintf(stderr, "[report-hold] t=%lluus #%lu get=0x%X held=%lluus\n",
+                                now, ++rheld_n, s_fifo_getoff, now - rheld_since); }
+                    rheld_since = 0;
                 }
             }
             for (u32 i = 0; i < count; i++) {
@@ -2207,10 +2264,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * GPU waits there by design until the label is released. Ascension's
      * frame waits on a label its SPU post-process tasks write when they are
      * done with the frame; following put dropped the frame mid-wait. Nor is
-     * a patched park held for SPU work (GCM_PARK_SPU_HOLD_MS), which bounds
-     * its own wait. */
+     * a patched park or a report held for SPU work (GCM_PARK_SPU_HOLD_MS,
+     * GCM_REPORT_SPU_HOLD_MS), each of which bounds its own wait. */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (why && (strcmp(why, "parked") == 0 || strcmp(why, "sema-acquire") == 0 || strcmp(why, "flip-pace") == 0 || strcmp(why, "spu-hold") == 0)) { stuck = 0; last = s_fifo_getoff; }
+      if (why && (strcmp(why, "parked") == 0 || strcmp(why, "sema-acquire") == 0 || strcmp(why, "flip-pace") == 0 || strcmp(why, "spu-hold") == 0 || strcmp(why, "report-hold") == 0)) { stuck = 0; last = s_fifo_getoff; }
       else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }

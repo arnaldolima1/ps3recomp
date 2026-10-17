@@ -1145,19 +1145,56 @@ int spu_workload_current_task(void) { return s_cur_task; }
  * RSX, which runs a frame in no time, from overtaking that work where a real
  * RSX would still be drawing (GCM_PARK_SPU_HOLD_MS, cellGcmSys.c). */
 static volatile long s_tasks_out_of_wait;
+/* The last running task back in its wait: a GET_REPORT held for the tasks
+ * (GCM_REPORT_SPU_HOLD_MS) can go now, so wake the walker instead of letting
+ * it find out at its next poll. */
+extern void cellGcm_fifo_kick(void);
+static void spu_task_back_in_wait(void)
+{
+    if (__atomic_sub_fetch(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL) == 0)
+        cellGcm_fifo_kick();
+}
 static _Thread_local int s_task_out;
-long spu_taskset_tasks_running(void) { return __atomic_load_n(&s_tasks_out_of_wait, __ATOMIC_ACQUIRE); }
+/* Also a task still parked whose signal is already set: it has work and is
+ * about to run. Right after RsxSync signals the five post-process tasks there
+ * is an instant when all of them are signalled but none has woken; counting
+ * only woken tasks let the GPU hold go there, frame 2's reports landed before
+ * round 1 had started, and God of War: Ascension stopped at the end of
+ * loading (deterministically once its SPU jobs ran lifted). */
+long spu_taskset_tasks_running(void)
+{
+    const long n = __atomic_load_n(&s_tasks_out_of_wait, __ATOMIC_ACQUIRE);
+    if (n) return n;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        const uint64_t k = s_parked[i];
+        if (k && spurs_bitset_test((uint32_t)(k >> 32) + CSTS_SIGNALLED, (uint32_t)(k & 0xFFFFFFFFu) - 1u))
+            return 1;
+    }
+    return 0;
+}
 /* A task that ends while out of a wait is no longer running. */
 void spu_taskset_task_ended(void)
 {
-    if (s_task_out) { s_task_out = 0; __atomic_fetch_sub(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL); }
+    if (s_task_out) { s_task_out = 0; spu_task_back_in_wait(); }
+}
+
+/* A wait that timed out with its bit already set: the commit that set it did
+ * not wake the waiter. Counted, and logged with SPU_WAITSIG_MISSLOG. */
+static volatile long s_waitsig_missed;
+static void spu_waitsig_missed(uint32_t taskId, uint32_t taskset_ea)
+{
+    const long n = __atomic_add_fetch(&s_waitsig_missed, 1, __ATOMIC_RELAXED);
+    static int lg = -1; if (lg < 0) lg = getenv("SPU_WAITSIG_MISSLOG") ? 1 : 0;
+    if (lg) { extern unsigned long long ps3_qpc_us(void);
+        fprintf(stderr, "[missed-wake] t=%lluus #%ld task=%u taskset=0x%08X\n",
+                ps3_qpc_us(), n, taskId, taskset_ea); }
 }
 
 int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
     s_cur_task = (int)taskId;
-    if (s_task_out) { s_task_out = 0; __atomic_fetch_sub(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL); }
+    if (s_task_out) { s_task_out = 0; spu_task_back_in_wait(); }
     /* ran= is the wall time this task spent OUT of the wait (decode/mix work
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
@@ -1205,6 +1242,16 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         }
     }
     unsigned secs = 0;
+    /* SPU_WAITSIG_POLL_MS (default 2): how often the wait re-checks its bit
+     * without being woken. A commit that sets it is meant to wake the waiter
+     * (spu_taskset_line_committed), but one that lands between the check and
+     * the sleep, or for a task not yet in s_parked, does not; with a 1 s
+     * timeout that cost God of War: Ascension's cutscene a one-second freeze
+     * every few seconds once the GPU stopped pacing its tasks. */
+    static int poll_ms = -1;
+    if (poll_ms < 0) { const char* e = getenv("SPU_WAITSIG_POLL_MS"); poll_ms = e ? atoi(e) : 2;
+                       if (poll_ms <= 0 || poll_ms > 1000) poll_ms = 1000; }
+    unsigned waited_ms = 0;
     /* LBP_WS_DRAIN=<secs>: EXPERIMENT (general work-drained approximation).
      * A task ENTERING WAIT_SIGNAL has drained the work dispatched to it. In our
      * one-shot SPU model the producer task ran to completion already, so the
@@ -1221,7 +1268,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, (DWORD)poll_ms, 0)) {
+            if (spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) { spu_waitsig_missed(taskId, taskset_ea); break; }
+            if ((waited_ms += (unsigned)poll_ms) < 1000) continue;
+            waited_ms = 0;
             static int _n = 0;
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
@@ -1229,13 +1279,21 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
+    /* Counted as running before its signal bit is cleared, so the GPU hold
+     * (spu_taskset_tasks_running) never misses it between the two. */
+    if (!s_task_out) { s_task_out = 1; __atomic_fetch_add(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL); }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)poll_ms * 1000000L;
+        while (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
         if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+            if (spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) { spu_waitsig_missed(taskId, taskset_ea); break; }
+            if ((waited_ms += (unsigned)poll_ms) < 1000) continue;
+            waited_ms = 0;
             static int _n = 0;
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
@@ -1243,6 +1301,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
+    /* Counted as running before its signal bit is cleared, so the GPU hold
+     * (spu_taskset_tasks_running) never misses it between the two. */
+    if (!s_task_out) { s_task_out = 1; __atomic_fetch_add(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL); }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
@@ -1250,7 +1311,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
-    s_task_out = 1; __atomic_fetch_add(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL);
+    if (!s_task_out) { s_task_out = 1; __atomic_fetch_add(&s_tasks_out_of_wait, 1, __ATOMIC_ACQ_REL); }
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
     if (s_ttl) { extern unsigned long long ps3_qpc_us(void);
