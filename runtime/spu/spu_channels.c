@@ -838,9 +838,18 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (s_v < 0) { const char* e = getenv("SPU_ATOM_EA");
                          s_vl = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s_v = s_vl ? 1 : 0; }
           if (s_v && (ea & ~127u) == s_vl)
-              fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
-                      ctx->atomic_stat ? "FAIL" : "OK",
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+          { extern unsigned long long ps3_qpc_us(void);
+            /* t= and the line's words after the commit, so commits line up
+             * with the GPU's [GET_REPORT] and the PPU's [ww] on one clock. */
+            const uint8_t* r = vm_base + (ea & ~127u);
+            char w[400]; int o = 0;
+            for (int i = 0; i < 128 && o < (int)sizeof w - 10; i += 4)
+                o += snprintf(w + o, sizeof w - (size_t)o, "%s%02X%02X%02X%02X", i ? " " : "",
+                              r[i], r[i + 1], r[i + 2], r[i + 3]);
+            fprintf(stderr, "[atom-ea] t=%lluus PUTLLC %s lr=0x%05X ea=0x%08X wid=%u RAM=%s\n",
+                    ps3_qpc_us(), ctx->atomic_stat ? "FAIL" : "OK",
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+                    ctx->policy_mode ? ctx->ls[0x1DF] : 255u, w); } }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {

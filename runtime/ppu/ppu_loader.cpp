@@ -44,6 +44,7 @@
 #include <unistd.h>
 #endif
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+extern "C" unsigned long long ps3_qpc_us(void);   /* cellGcmSys.c: [ww] t= */
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
  * each frame) -- the same trick the [BLOCK] profiler uses. */
@@ -1902,9 +1903,9 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                * as three different guest functions. ctx->lr is written by the
                * lifter at every direct call site, so it names the real caller. */
               extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
-              fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X"
+              fprintf(stderr, "[ww] t=%lluus 0x%08X <- 0x%X (w%d) guest-fn=0x%08X"
                               " lr=0x%08X tid=%u\n",
-                      a, v, width, ppu_prof_resolve_host(ra),
+                      ps3_qpc_us(), a, v, width, ppu_prof_resolve_host(ra),
                       g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
                       g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u);
               /* On the first write to the watched word, dump the guest caller

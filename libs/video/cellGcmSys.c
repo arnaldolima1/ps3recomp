@@ -2089,8 +2089,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         { /* GCM_REPORTLOG=<n>: the first n reports (default 6), with the time. */
                           static long rn = 0, rmax = -1;
                           if (rmax < 0) { const char* e = getenv("GCM_REPORTLOG"); rmax = e ? atol(e) : 6; }
-                          if (rn++ < rmax) printf("[GET_REPORT] t=%llu type=%u off=0x%X dma=0x%08X%c",
-                                                  (unsigned long long)ps3_ms_now(), v >> 24, off, s_report_dma, 10);
+                          if (rn++ < rmax) printf("[GET_REPORT] t=%lluus type=%u off=0x%X dma=0x%08X%c",
+                                                  ps3_qpc_us(), v >> 24, off, s_report_dma, 10);
                           /* GCM_REPORTFF=1: a GET_REPORT word still 0xFFFFFFFF (a placeholder
                            * not patched yet): where it is, its neighbours, and what the same
                            * word holds when the next reports go by. */

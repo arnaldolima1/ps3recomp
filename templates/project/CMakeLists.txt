@@ -194,7 +194,17 @@ if(SPU_SOURCES)
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
     if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+        # SSE4.1 as well (any x86-64 since ~2008): spu_shufb is pshufb/blendv
+        # only under __SSE4_1__, and without it every shufb in lifted code is
+        # a 16-byte loop (a third of the job worker in Ascension's profile).
+        # The runtime gets the same flag; probed, as Apple arm64 clang rejects it.
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag(-msse4.1 PORT_HAS_MSSE41)
+        if(PORT_HAS_MSSE41)
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1")
+        else()
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+        endif()
     endif()
 endif()
 

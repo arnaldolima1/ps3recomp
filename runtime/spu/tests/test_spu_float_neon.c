@@ -1,8 +1,9 @@
-/* The NEON spu_fa/fs/fm/fma/fms/fnms must be bit-identical to the scalar
- * references (spu_*_ref) for every input: random words, ordinary floats, the
- * normal/extended-range boundaries, zeros and denormals, mixed per lane.
+/* The NEON and SSE4.1 spu_fa/fs/fm/fma/fms/fnms must be bit-identical to the
+ * scalar references (spu_*_ref) for every input: random words, ordinary floats,
+ * the normal/extended-range boundaries, zeros and denormals, mixed per lane.
  * Prints a rough speed comparison too. Build on arm64:
- *   cc -O2 -I.. -I../.. -I../../.. test_spu_float_neon.c -o t && ./t */
+ *   cc -O2 -I.. -I../.. -I../../.. test_spu_float_neon.c -o t && ./t
+ * or on x86-64 with -msse4.1 (clang-cl: clang-cl -O2 -msse4.1 ...). */
 #include "../spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,8 +32,8 @@ static uint32_t rnd_float(void)
 
 int main(void)
 {
-#if !defined(__ARM_NEON)
-    puts("test_spu_float_neon: no NEON, nothing to compare");
+#if !defined(__ARM_NEON) && !defined(__SSE4_1__)
+    puts("test_spu_float_neon: no NEON or SSE4.1, nothing to compare");
     return 0;
 #else
     long bad = 0;
@@ -189,7 +190,7 @@ int main(void)
     for (int i = 0; i < R; i++) { const u128* q = in[i & 255];
         u128 r1 = spu_fma_ref(q[0], q[1], q[2]), r2 = spu_fm_ref(q[0], q[1]); acc += r1._u32[i & 3] ^ r2._u32[(i + 1) & 3]; }
     clock_t t2 = clock();
-    printf("fma+fm pair: neon %.1f ns, scalar %.1f ns (acc %u)\n",
+    printf("fma+fm pair: vector %.1f ns, scalar %.1f ns (acc %u)\n",
            (t1 - t0) * 1e9 / CLOCKS_PER_SEC / R, (t2 - t1) * 1e9 / CLOCKS_PER_SEC / R, acc);
     return 0;
 #endif
