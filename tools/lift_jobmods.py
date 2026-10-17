@@ -135,7 +135,18 @@ def main():
     ap.add_argument("--symbol-prefix", default="port", metavar="NAME",
                     help="C symbol prefix for the registration functions, so two "
                          "ports linked in one tree cannot collide (default: port).")
+    ap.add_argument("--extra-funcs-json", default=None, metavar="FILE",
+                    help="Per-module extra function entries: a JSON object "
+                         "{module name: [LS address, ...]}. Every module shares "
+                         "LS 0x4000, so an address one module needs is mid-function "
+                         "in another; the global $LBP_JOBMOD_EXTRA_FUNCS cannot say "
+                         "which. The list is what the runtime's '[spu-smc] microstep "
+                         "... ovl=<image>' lines report for that module's image.")
     args = ap.parse_args()
+    per_module = {}
+    if args.extra_funcs_json:
+        with open(args.extra_funcs_json) as f:
+            per_module = {k: [hex(int(str(a), 0)) for a in v] for k, v in json.load(f).items()}
     JOBMODS = args.jobmods
     OUTDIR  = args.out
     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
@@ -169,7 +180,8 @@ def main():
         if name in CODE_END:
             cmd += ["--code-end", hex(CODE_END[name])]
         # Only offer addresses that fall inside THIS module's image.
-        inside = [a for a in EXTRA_FUNCS if BASE <= int(a, 0) < BASE + len(raw)]
+        inside = [a for a in EXTRA_FUNCS + per_module.get(name, [])
+                  if BASE <= int(a, 0) < BASE + len(raw)]
         # The module's first function starts right after the 0x30-byte header
         # (`4 ila | entry | size | 0 | 0 | C0DEC0DE | 0 | 0 | n`). Usually it is
         # reached by a branch and found anyway, but in two modules it is a bare

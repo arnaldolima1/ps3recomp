@@ -2177,11 +2177,25 @@ static int spu_smc_microstep(spu_context* ctx)
          * III`s job kernel dies here on an `ilh` at LS 0x6638 -- a perfectly
          * ordinary instruction the interpreter handles -- and with it the
          * decompression job it was running never completes. */
-        { static int _n = 0;
-          if (_n++ < 8)
-              fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
-                      " microstep set -- handing to the interpreter (steps=%d)\n",
-                      ctx->image_id, pc, w, steps); }
+        /* Every DISTINCT entry, once, with the resident overlay: each one is
+         * code the lift has no function for (a runtime-built return address,
+         * a function pointer), and the list is what a re-lift needs as extra
+         * entries. A capped count showed the first 8 and hid the hot one. */
+        { static struct { int img, ovl; uint32_t pc; } seen[256]; static int n_seen = 0;
+          int known = 0;
+          for (int i = 0; i < n_seen; i++)
+              if (seen[i].pc == pc && seen[i].img == ctx->image_id &&
+                  seen[i].ovl == ctx->resident_ovl) { known = 1; break; }
+          if (!known && n_seen < 256) {
+              seen[n_seen].img = ctx->image_id; seen[n_seen].ovl = ctx->resident_ovl;
+              seen[n_seen++].pc = pc;
+              /* start= is where the unresolved branch landed -- the address a
+               * lift needs as an entry; pc= is only where the microstep gave
+               * up, steps instructions further on. */
+              fprintf(stderr, "[spu-smc] microstep img=%d ovl=%d start=0x%05X pc=0x%05X word 0x%08X"
+                      " not in the microstep set -- handing to the interpreter (steps=%d)\n",
+                      ctx->image_id, ctx->resident_ovl, ctx->pc & SPU_LS_MASK & ~3u, pc, w, steps);
+          } }
         ctx->pc = pc;
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through

@@ -26,6 +26,10 @@ typedef struct VdecFfPicture {
     u32 token;        /* the token passed with the AU this picture came from */
     int pict_type;    /* 1 I, 2 P, 3 B, 0 unknown (FFmpeg's AVPictureType) */
     int key;          /* keyframe (IDR for H.264) */
+    u32 duration_90k; /* display time in 90 kHz ticks, from the stream's frame
+                         rate (3003, 29.97 Hz, when it declares none) */
+    u8  frame_rate_code; /* MPEG-2 frame_rate_code: 1 23.976 .. 8 60; 0 unknown */
+    u8  progressive;     /* progressive_frame */
 } VdecFfPicture;
 
 typedef void (*vdec_ff_emit_fn)(void* ctx, const VdecFfPicture* pic);

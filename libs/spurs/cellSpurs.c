@@ -1153,7 +1153,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+            if (ps3_log_verbose()) printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
                    context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
@@ -1362,7 +1362,7 @@ s32 cellSpursCreateTask2(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         ctx  = vm_read32(attr_ea + 0x0C);   /* low word of the 64-bit eaContext */
         ls   = attr_ea + 0x10;
     }
-    printf("[cellSpurs] CreateTask2 elf=0x%08X arg=0x%08X ctx=0x%08X size=0x%X\n",
+    if (ps3_log_verbose()) printf("[cellSpurs] CreateTask2 elf=0x%08X arg=0x%08X ctx=0x%08X size=0x%X\n",
            (u32)(uintptr_t)elf, argument_ea, ctx, size);
     return cellSpursCreateTask(taskset, taskId, elf, (void*)(uintptr_t)ctx, size, ls, argument_ea);
 }
@@ -1450,6 +1450,41 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
     }
 
     return CELL_SPURS_TASK_ERROR_SRCH;
+}
+
+/* cellSpursJoinTask2(taskset, taskId, exitCode): wait for a task of a
+ * second-generation taskset to exit. A task's exit clears its bit in the
+ * taskset's enabled bitset (+0x30, task 0 = MSB; spu_taskset_task_exited),
+ * so that bit is what is waited on. Unregistered, it returned at once:
+ * God of War: Ascension joins its tasks (35 calls as the menu scene starts)
+ * and carried on while they still ran. The exit code is not tracked; 0. */
+s32 cellSpursJoinTask2(CellSpursTaskset* taskset, CellSpursTaskId taskId,
+                       s32* exitCode)
+{
+    const u32 ts = (u32)(uintptr_t)taskset;
+    const u32 ec = (u32)(uintptr_t)exitCode;
+    if (!ts) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (taskId >= CELL_SPURS_MAX_TASK) return CELL_SPURS_TASK_ERROR_INVAL;
+    const u32 byte = ts + 0x30 + taskId / 8;
+    const u8 bit = (u8)(0x80u >> (taskId % 8));
+    u32 waited = 0;
+    while (vm_read8(byte) & bit) {
+        if (waited == 20000) {
+            printf("[cellSpurs] JoinTask2(taskset=0x%08X id=%u) still running after 20 s\n",
+                   ts, taskId);
+            return CELL_SPURS_TASK_ERROR_SRCH;
+        }
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+        waited++;
+    }
+    if (ec) vm_write32(ec, 0);
+    if (ps3_log_verbose())
+        printf("[cellSpurs] JoinTask2(taskset=0x%08X id=%u) after %u ms\n", ts, taskId, waited);
+    return CELL_OK;
 }
 
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId)

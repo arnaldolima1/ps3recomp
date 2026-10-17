@@ -166,6 +166,28 @@ static int vdec_ff_receive(VdecFf* d, vdec_ff_emit_fn emit, void* cb_ctx)
             pic.token = (u32)(f->pts != AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp);
             pic.pict_type = (int)f->pict_type;
             pic.key = (f->flags & AV_FRAME_FLAG_KEY) != 0;
+            {
+                const AVRational fr = d->ctx->framerate;
+                u64 dur = (fr.num > 0 && fr.den > 0)
+                    ? (u64)90000 * (u64)fr.den / (u64)fr.num : 3003u;
+                dur += dur * (u64)(f->repeat_pict > 0 ? f->repeat_pict : 0) / 2u;
+                pic.duration_90k = (u32)dur;
+                /* The MPEG-2 frame_rate_code the stream's sequence header
+                 * carries, recovered from FFmpeg's rate: the nearest of the
+                 * eight standard ones. */
+                static const double rates[9] = { 0, 24000.0 / 1001, 24, 25,
+                    30000.0 / 1001, 30, 50, 60000.0 / 1001, 60 };
+                if (fr.num > 0 && fr.den > 0) {
+                    const double r = (double)fr.num / (double)fr.den;
+                    int best = 0; double bd = 1e9;
+                    for (int k = 1; k <= 8; k++) {
+                        const double dd = r > rates[k] ? r - rates[k] : rates[k] - r;
+                        if (dd < bd) { bd = dd; best = k; }
+                    }
+                    pic.frame_rate_code = (u8)(bd < 0.5 ? best : 0);
+                }
+                pic.progressive = (f->flags & AV_FRAME_FLAG_INTERLACED) ? 0 : 1;
+            }
             emit(cb_ctx, &pic);                        /* takes pic.yuv */
         }
         d->ff->av_frame_unref(f);

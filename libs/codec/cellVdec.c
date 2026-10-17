@@ -17,6 +17,7 @@
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
+#include "../../runtime/ps3_log.h"      /* ps3_log_verbose */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -32,6 +33,8 @@ typedef struct {
     CellVdecPicItem item;
     int pictType;       /* 1 I, 2 P, 3 B, 0 unknown */
     int key;
+    u8  frameRateCode;  /* MPEG-2 frame_rate_code (0 unknown) */
+    u8  progressive;
 } VdecPic;
 
 typedef struct {
@@ -52,7 +55,11 @@ typedef struct {
     u32 qHead, qCount;
     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
     u32 newPics;        /* pictures queued by the current decode call */
+    u64 nextPts;        /* timestamp for the next picture whose AU had none */
 } VdecSlot;
+
+/* CODEC_TS_INVALID: both halves of the AU's pts/dts all ones. */
+#define VDEC_TS_INVALID 0xFFFFFFFFFFFFFFFFull
 
 static VdecSlot s_vdec[MAX_VDEC];
 
@@ -100,12 +107,26 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
     q->yuv = pic->yuv;
     q->pictType = pic->pict_type;
     q->key = pic->key;
+    q->frameRateCode = pic->frame_rate_code;
+    q->progressive = pic->progressive;
     q->item.codecType = v->codecType;
     q->item.startAddr = au->startAddr;
     q->item.size      = au->size;
     q->item.auNum     = pic->token;
     q->item.pts       = au->pts;
     q->item.dts       = au->dts;
+    /* An elementary stream (God of War: Ascension's OPENINGINT6.M2V) hands
+     * every AU over without a timestamp. The PS3 decoder then numbers the
+     * pictures itself, one frame period apart (RPCS3 does the same); left
+     * invalid, the title's player never found a picture due for display,
+     * took one and let the queue fill, and the movie stayed black. */
+    if (au->pts == VDEC_TS_INVALID) {
+        q->item.pts = v->nextPts;
+        if (au->dts == VDEC_TS_INVALID) q->item.dts = v->nextPts;
+    } else {
+        v->nextPts = au->pts;
+    }
+    v->nextPts += pic->duration_90k ? pic->duration_90k : 3003u;
     q->item.userData  = au->userData;
     q->item.status    = 0;
     q->item.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
@@ -183,6 +204,25 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
     return (s32)CELL_VDEC_ERROR_BUSY;
 }
 
+/* The Ex pair takes CellVdecTypeEx { u32 codecType; u32 codecSpecificInfo }
+ * and CellVdecResourceEx; codecType is still the first word, and the rest is
+ * decoder tuning a host decoder does not need. Unregistered, both "returned"
+ * CELL_OK without writing anything: God of War: Ascension got a cmdDepth of 0
+ * and no handle, so its opening cinematic never started and the menu stayed
+ * behind its black fade card. */
+s32 cellVdecQueryAttrEx(const CellVdecType* type, void* attr)
+{
+    printf("[cellVdec] QueryAttrEx(codecType=%u)\n",
+           type ? vm_read32(GUEST_EA(type)) : 0u);
+    return cellVdecQueryAttr(type, attr);
+}
+
+s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
+                   const CellVdecCb* cb, CellVdecHandle* handle)
+{
+    return cellVdecOpen(type, res, cb, handle);
+}
+
 s32 cellVdecClose(CellVdecHandle handle)
 {
     printf("[cellVdec] Close(handle=%u)\n", handle);
@@ -207,6 +247,7 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
         return (s32)CELL_VDEC_ERROR_ARG;
 
     s_vdec[handle].seqStarted = 1;
+    s_vdec[handle].nextPts = 0;
     if (s_vdec[handle].ff) {
         /* A new sequence: nothing from the last one is shown. */
         vdec_ff_reset(s_vdec[handle].ff);
@@ -259,7 +300,7 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     au.dts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, dts));
     au.userData  = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, userData));
 
-    printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
+    if (ps3_log_verbose()) printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
            handle, au.startAddr, au.size,
            (unsigned long long)au.pts);
 
@@ -361,7 +402,24 @@ static void vdec_write_pic_type(CellVdecHandle handle, const VdecPic* q)
         vm_write8(info + 0x05, 3);
         vm_write8(info + 0x06, (u8)(q->key && t == 1));
     } else if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
+        /* CellVdecMpeg2Info (RPCS3's layout): +0 u16 horizontal_size,
+         * +2 u16 vertical_size, +4 u8 aspect_ratio_information,
+         * +5 u8 frame_rate_code, +6 u8 progressive_sequence, +7 u8 low_delay,
+         * +8 video_format, +9 colour_description, ... +0x12 u8
+         * picture_coding_type[2], +0x14 u8 picture_structure[2],
+         * +0x16 top_field_first, +0x17 repeat_first_field,
+         * +0x18 progressive_frame.
+         * God of War: Ascension's player takes its frame rate from
+         * frame_rate_code: left 0, its movie clock times 0 frames per second
+         * asked for no picture after the first, and the cutscene stayed black. */
+        const u32 w = q->item.width, h = q->item.height;
+        vm_write8(info + 0x04, (u8)((w && h && w * 9u == h * 16u) ? 3 : 2));
+        vm_write8(info + 0x05, q->frameRateCode ? q->frameRateCode : 4);
+        vm_write8(info + 0x06, q->progressive);
+        vm_write8(info + 0x08, 5);                     /* video_format: unspecified */
         vm_write8(info + 0x12, (u8)(t >= 1 && t <= 3 ? t : 0));
+        vm_write8(info + 0x14, 3);                     /* picture_structure: frame */
+        vm_write8(info + 0x18, q->progressive);
     }
 }
 
@@ -377,6 +435,12 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
         if (!v->qCount)
             return (s32)CELL_VDEC_ERROR_EMPTY;
         const VdecPic* q = &v->queue[v->qHead];
+        { static u32 n = 0;
+          if (n < 6 || (n % 300) == 0)
+              printf("[cellVdec] GetPicItem #%u handle=%u queued=%u au=%u pts=%llu type=%d\n",
+                     n, handle, v->qCount, q->item.auNum,
+                     (unsigned long long)q->item.pts, q->pictType);
+          n++; }
         vdec_write_item(handle, &q->item);
         vdec_write_pic_type(handle, q);
         vm_write32(out, VDEC_ITEM_EA(handle));
@@ -403,6 +467,18 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
     VdecPic* q = &v->queue[v->qHead];
     v->qHead = (v->qHead + 1) % VDEC_QUEUE;
     v->qCount--;
+    /* Where the title takes its pictures, and in what format: the first few,
+     * then one in 300. A movie whose audio plays over a black screen has a
+     * decoder that works and a picture that never reaches the texture. */
+    { static u32 n = 0;
+      if (n < 6 || (n % 300) == 0) {
+          const u32 w = q->item.width, h = q->item.height;
+          printf("[cellVdec] GetPicture #%u dst=0x%08X type=%u matrix=%u alpha=%u %ux%u"
+                 " Y(center)=%u au=%u pts=%llu\n", n, dst, type, matrix, alpha, w, h,
+                 (w && h && q->yuv) ? q->yuv[(size_t)(h / 2) * w + w / 2] : 0u,
+                 q->item.auNum, (unsigned long long)q->item.pts);
+      }
+      n++; }
     if (dst)                                           /* NULL: a skip */
         vdec_store_picture(dst, q->yuv, q->item.width, q->item.height,
                            type, matrix, alpha);

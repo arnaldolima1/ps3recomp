@@ -208,6 +208,24 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           }
       } }
 
+    /* HLE_BT_NID=<nid hex>[,<n>]: the guest stack of the first n (default 4)
+     * calls to ONE import. HLE_BT_EVERY samples every call of a thread, which
+     * buries a rare call (a movie player's one cellVdecGetPicItem) under
+     * millions of others; this names the caller of the one that matters. */
+    { static int armed = -1; static uint32_t bt_nid = 0; static long bt_left = 0;
+      if (armed < 0) {
+          const char* e = getenv("HLE_BT_NID"); unsigned v = 0; long k = 4;
+          armed = e && sscanf(e, "%x,%ld", &v, &k) >= 1;
+          bt_nid = v; bt_left = k;
+      }
+      if (armed && nid == bt_nid && ctx && bt_left-- > 0) {
+          extern void ppu_dump_guest_stack(ppu_context*, const char*);
+          char tag[64];
+          snprintf(tag, sizeof tag, "hle-nid 0x%08X tid=%llu lr=0x%08X", nid,
+                   (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+          ppu_dump_guest_stack(ctx, tag);
+      } }
+
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
      * across a cross-module call: the glink stub does `std r2,40(r1)` before jumping and
      * the caller does `ld r2,40(r1)` after. Our HLE import stubs (`ps3_hle_call(nid);
