@@ -291,13 +291,25 @@ typedef struct spu_mfc_slot {
 
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
+/* Bumped whenever a slot is freed: invalidates every thread's cache below. */
+static volatile long s_mfc_gen = 1;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    /* Each channel write of a DMA command looked its engine up under the claim
+     * lock, walking the list -- ~3% of a busy SPU job thread. A context runs
+     * on one host thread at a time, so a per-thread last hit is almost always
+     * right; the generation drops it when any slot is freed. */
+    static SPU_TLS spu_context* t_ctx;
+    static SPU_TLS mfc_engine* t_mfc;
+    static SPU_TLS long t_gen;
+    const long gen = __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE);
+    if (t_ctx == ctx && t_gen == gen) return t_mfc;
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
             ReleaseSRWLockShared(&s_mfc_claim_lock);
+            t_ctx = ctx; t_mfc = &slot->mfc; t_gen = gen;
             return &slot->mfc;
         }
     }
@@ -334,6 +346,7 @@ void spu_mfc_release(spu_context* ctx)
         if ((*link)->ctx != ctx) continue;
         spu_mfc_slot* slot = *link;
         *link = slot->next;
+        __atomic_add_fetch(&s_mfc_gen, 1, __ATOMIC_RELEASE);
         free(slot);
         break;
     }
@@ -353,6 +366,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
             *link = slot->next;
+            __atomic_add_fetch(&s_mfc_gen, 1, __ATOMIC_RELEASE);
             free(slot);
         } else {
             link = &slot->next;

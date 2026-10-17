@@ -73,6 +73,17 @@ static inline uint8x16_t spu__iota(void) {
     static const uint8_t k[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
     return vld1q_u8(k);
 }
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+#include <smmintrin.h>
+/* SSE4.1 forms of some hot integer ops (selb, rotqbyi, shlqbyi); the scalar
+ * definitions stay as spu_X_ref (tests/test_spu_sse_ops.c compares them). */
+static inline __m128i spu__xi_ld(u128 a) { __m128i v; memcpy(&v, &a, 16); return v; }
+static inline u128 spu__xi_st(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
+/* Host-order pshufb control for an SPU-order byte rotate/shift: result SPU
+ * byte i takes SPU byte i + sh, SPU byte P sits at host byte P ^ 3. */
+static inline __m128i spu__xi_spu_index(void) {     /* host byte h -> SPU byte h ^ 3 */
+    return _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+}
 #endif
 
 /* Integer ops with a NEON form further down (end of file); the scalar definitions are
@@ -355,6 +366,11 @@ static inline u128 spu_selb_ref(u128 a, u128 b, u128 c) {
 static inline u128 spu_selb(u128 a, u128 b, u128 c) {
     return spu__st(vbslq_u32(spu__ld(c), spu__ld(b), spu__ld(a)));
 }
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+static inline u128 spu_selb(u128 a, u128 b, u128 c) {
+    const __m128i C = spu__xi_ld(c);
+    return spu__xi_st(_mm_or_si128(_mm_andnot_si128(C, spu__xi_ld(a)), _mm_and_si128(spu__xi_ld(b), C)));
+}
 #else
 static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, c); }
 #endif
@@ -466,6 +482,14 @@ static inline u128 spu_shlqbyi_ref(u128 a, int sh) { u128 r=spu_zero(); sh&=0x1F
 static inline u128 spu_shlqbyi(u128 a, int sh) {
     return spu__perm(a, vaddq_u8(spu__iota(), vdupq_n_u8((uint8_t)(sh & 0x1F))));
 }
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+static inline u128 spu_shlqbyi(u128 a, int sh) {
+    /* source SPU byte i + sh, zero past 15 (pshufb zeroes on bit 7) */
+    const __m128i s = _mm_add_epi8(spu__xi_spu_index(), _mm_set1_epi8((char)(sh & 0x1F)));
+    const __m128i past = _mm_cmpgt_epi8(s, _mm_set1_epi8(15));
+    const __m128i ctl = _mm_or_si128(_mm_xor_si128(s, _mm_set1_epi8(3)), past);
+    return spu__xi_st(_mm_shuffle_epi8(spu__xi_ld(a), ctl));
+}
 #else
 static inline u128 spu_shlqbyi(u128 a, int sh) { return spu_shlqbyi_ref(a, sh); }
 #endif
@@ -473,6 +497,11 @@ static inline u128 spu_rotqbyi_ref(u128 a, int sh) { u128 r; sh&=0x0F; for(int i
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 static inline u128 spu_rotqbyi(u128 a, int sh) {
     return spu__perm(a, vandq_u8(vaddq_u8(spu__iota(), vdupq_n_u8((uint8_t)sh)), vdupq_n_u8(15)));
+}
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+static inline u128 spu_rotqbyi(u128 a, int sh) {
+    const __m128i s = _mm_and_si128(_mm_add_epi8(spu__xi_spu_index(), _mm_set1_epi8((char)sh)), _mm_set1_epi8(15));
+    return spu__xi_st(_mm_shuffle_epi8(spu__xi_ld(a), _mm_xor_si128(s, _mm_set1_epi8(3))));
 }
 #else
 static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_rotqbyi_ref(a, sh); }
@@ -973,10 +1002,31 @@ static inline int64_t spu__sf_key(uint32_t x) {
     return (x & 0x80000000u) ? -m : m;
 }
 static inline int64_t spu__sf_mag(uint32_t x) { return (x & 0x7F800000u) ? (int64_t)(x & 0x7FFFFFFFu) : 0; }
-SPU__SF_V2(spu_fceq,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcgt,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcmeq, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcmgt, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fceq_ref,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcgt_ref,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcmeq_ref, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcmgt_ref, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+#if defined(__SSE4_1__) && !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+/* The compare keys fit 32 bits: a magnitude is at most 0x7FFFFFFF, so the
+ * signed key (zero for any exponent-0 word) compares with pcmpgtd/pcmpeqd. */
+static inline __m128i spu__xs_mag(__m128i x) {
+    const __m128i zero = _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    return _mm_andnot_si128(zero, _mm_and_si128(x, _mm_set1_epi32(0x7FFFFFFF)));
+}
+static inline __m128i spu__xs_key(__m128i x) {
+    const __m128i neg = _mm_srai_epi32(x, 31), m = spu__xs_mag(x);
+    return _mm_sub_epi32(_mm_xor_si128(m, neg), neg);   /* -m where the sign is set */
+}
+static inline u128 spu_fceq(u128 a, u128 b)  { return spu__xs_st(_mm_cmpeq_epi32(spu__xs_key(spu__xs_ld(a)), spu__xs_key(spu__xs_ld(b)))); }
+static inline u128 spu_fcgt(u128 a, u128 b)  { return spu__xs_st(_mm_cmpgt_epi32(spu__xs_key(spu__xs_ld(a)), spu__xs_key(spu__xs_ld(b)))); }
+static inline u128 spu_fcmeq(u128 a, u128 b) { return spu__xs_st(_mm_cmpeq_epi32(spu__xs_mag(spu__xs_ld(a)), spu__xs_mag(spu__xs_ld(b)))); }
+static inline u128 spu_fcmgt(u128 a, u128 b) { return spu__xs_st(_mm_cmpgt_epi32(spu__xs_mag(spu__xs_ld(a)), spu__xs_mag(spu__xs_ld(b)))); }
+#else
+static inline u128 spu_fceq(u128 a, u128 b)  { return spu_fceq_ref(a, b); }
+static inline u128 spu_fcgt(u128 a, u128 b)  { return spu_fcgt_ref(a, b); }
+static inline u128 spu_fcmeq(u128 a, u128 b) { return spu_fcmeq_ref(a, b); }
+static inline u128 spu_fcmgt(u128 a, u128 b) { return spu_fcmgt_ref(a, b); }
+#endif
 #undef SPU__SF_V2
 #undef SPU__SF_V3
 
@@ -998,8 +1048,29 @@ static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
 }
 static inline u128 spu_cflts(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
 static inline u128 spu_cfltu(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
-static inline u128 spu_csflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
+static inline u128 spu_csflt_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const int32_t v = a._s32[i];
     r._u32[i] = v ? spu__sf_pack(v < 0 ? 0x80000000u : 0, v < 0 ? 0u - (uint32_t)v : (uint32_t)v, -(155 - (i8 & 0xFF))) : 0; } return r; }
+#if defined(__SSE4_1__) && !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+/* int32 * 2^(i8 - 155) is exact in double; truncated to a single the way the
+ * float ops are (spu__xs_trunc0). Lanes outside the normal single range are
+ * redone by the scalar form. */
+static inline u128 spu_csflt(u128 a, int i8) {
+    const __m128i x = spu__xs_ld(a);
+    const __m128d sc = _mm_set1_pd(ldexp(1.0, (i8 & 0xFF) - 155));
+    __m128i oklo, okhi, zlo, zhi;
+    const __m128 lo = spu__xs_trunc0(_mm_mul_pd(_mm_cvtepi32_pd(x), sc), NULL, &oklo, &zlo);
+    const __m128 hi = spu__xs_trunc0(_mm_mul_pd(_mm_cvtepi32_pd(_mm_unpackhi_epi64(x, x)), sc), NULL, &okhi, &zhi);
+    u128 r = spu__xs_st(spu__xs_pos0(spu__xs_vec(lo, hi), zlo, zhi));
+    if (!spu__xs_all4(spu__xs_pack(oklo, okhi))) {
+        const u128 ref = spu_csflt_ref(a, i8);
+        uint32_t m[4]; _mm_storeu_si128((__m128i*)(void*)m, spu__xs_pack(oklo, okhi));
+        for (int i = 0; i < 4; i++) if (!m[i]) r._u32[i] = ref._u32[i];
+    }
+    return r;
+}
+#else
+static inline u128 spu_csflt(u128 a, int i8) { return spu_csflt_ref(a, i8); }
+#endif
 static inline u128 spu_cuflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
     r._u32[i] = v ? spu__sf_pack(0, v, -(155 - (i8 & 0xFF))) : 0; } return r; }
 
