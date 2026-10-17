@@ -57,8 +57,44 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
+/* SPU_JOB_HIST=1: SPU time per resident job module (or per image outside
+ * one), from the gaps between trampoline steps on each host thread; gaps over
+ * 2 ms are the thread parked and are dropped. Every 5 s, ms per second each. */
+static void spu_job_hist_step(const spu_context* ctx)
+{
+    static int s_on = -1;
+    if (s_on < 0) s_on = getenv("SPU_JOB_HIST") ? 1 : 0;
+    if (!s_on) return;
+    extern unsigned long long ps3_qpc_us(void);
+    enum { JH = 1024 };
+    static volatile long long s_us[JH];
+    static volatile unsigned long long s_t0;
+    static _Thread_local unsigned long long t_last;
+    static _Thread_local int t_key = -1;
+    const unsigned long long now = ps3_qpc_us();
+    if (t_key >= 0 && now - t_last < 2000)
+        __atomic_add_fetch(&s_us[t_key], (long long)(now - t_last), __ATOMIC_RELAXED);
+    t_last = now;
+    t_key = ctx->resident_ovl > 0 && ctx->resident_ovl < 600 ? ctx->resident_ovl
+                                                              : 600 + (ctx->image_id & 0xFF);
+    unsigned long long t0 = __atomic_load_n(&s_t0, __ATOMIC_RELAXED);
+    if (!t0) { __atomic_store_n(&s_t0, now, __ATOMIC_RELAXED); return; }
+    if (now - t0 < 5000000ull || !__atomic_compare_exchange_n(&s_t0, &t0, now, 0,
+                                                              __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    char line[1024]; int o = snprintf(line, sizeof line, "[job-hist] ms/s:");
+    for (int k = 0; k < JH && o < (int)sizeof line - 32; k++) {
+        const long long us = __atomic_exchange_n(&s_us[k], 0, __ATOMIC_RELAXED);
+        if (us >= 5000)   /* >= 1 ms/s */
+            o += snprintf(line + o, sizeof line - (size_t)o, k < 600 ? " ovl%d=%.1f" : " img%d=%.1f",
+                          k < 600 ? k : k - 600, us / 5000.0);
+    }
+    fprintf(stderr, "%s\n", line);
+}
+
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
+    spu_job_hist_step(ctx);
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);

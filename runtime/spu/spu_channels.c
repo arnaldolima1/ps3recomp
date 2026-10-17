@@ -1772,8 +1772,16 @@ int spu_lifted_probe(spu_context* ctx, uint32_t lsa)
      * 0 or 1): a job module's lifted function entered from interpreted code
      * returns by host return, past the interpreted caller. Missing job-module
      * entries go into the lift instead (jobmods_extra_funcs.json). Default 1. */
+    /* 8: the resident overlay too, but only while interrupts are disabled. The
+     * stall above comes from lifted job code running inside a job's interrupt
+     * window (module 214 enables them at 0x4414, disables them at 0x447C):
+     * interpreted code is never interrupted, lifted code is at every trampoline
+     * step, and the runtime's handler emulation does not survive that there.
+     * Outside the window the interpreted remainder of the job -- the whole job
+     * body after 0x4418, ~25M instructions/s in the cinematic -- can go back
+     * to lifted code. Default 9 (1 | 8). */
     static int s_mask = -1;
-    if (s_mask < 0) { const char* e = getenv("SPU_PROBE"); s_mask = e && *e ? atoi(e) : 1; }
+    if (s_mask < 0) { const char* e = getenv("SPU_PROBE"); s_mask = e && *e ? atoi(e) : 9; }
     int owner = 0;
     if (s_mask & 1) {
         const uint32_t pic = ctx->pic_delta;
@@ -1782,7 +1790,8 @@ int spu_lifted_probe(spu_context* ctx, uint32_t lsa)
         if (owner) return fn != NULL;
     }
     if ((s_mask & 2) && ctx->resident_task && spu_lookup(lsa, ctx->resident_task)) return 1;
-    if ((s_mask & 4) && ctx->resident_ovl && spu_lookup(lsa, ctx->resident_ovl)) return 1;
+    if (((s_mask & 4) || ((s_mask & 8) && !ctx->int_enable)) &&
+        ctx->resident_ovl && spu_lookup(lsa, ctx->resident_ovl)) return 1;
     return spu_lifted_lookup(ctx, lsa) != NULL;
 }
 

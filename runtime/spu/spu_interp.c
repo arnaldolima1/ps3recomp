@@ -355,10 +355,17 @@ static int spu_step(spu_context* ctx) {
             ctx->irq_saved = 0;
         }
         break;
-    case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
+    /* The conditional forms carry E/D too, effective when taken, as the lifter
+     * decodes them. Ignoring them here made interpreted and lifted code
+     * disagree inside a job's critical section (God of War: Ascension's job
+     * module 214 enables interrupts with a bihz at 0x4414 and disables them
+     * with one at 0x447C): a lifted disable followed by an interpreted
+     * re-enable left interrupts off for good, the DMA-list stall handler
+     * never ran, and the game stopped at the end of loading. */
+    case SPU_biz:  if (PREF(DST) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_binz: if (PREF(DST) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
     case SPU_stop: case SPU_stopd:
         ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
