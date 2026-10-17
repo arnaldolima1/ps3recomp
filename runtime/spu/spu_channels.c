@@ -914,6 +914,11 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * transfer), for lifted code the interpreter hooks never see. */
         if (channel == MFC_Cmd) {
             static int s_mi = -2, s_nea; static long s_mn, s_mmax; static uint32_t s_mea[8];
+            /* SPU_MFCLOG_LSA=<lo>,<hi> (hex): only transfers whose LS start is in [lo, hi). */
+            static uint32_t s_mlo, s_mhi = SPU_LS_SIZE;
+            if (s_mi == -2) { const char* l = getenv("SPU_MFCLOG_LSA");
+                              if (l) { char* end; s_mlo = (uint32_t)strtoul(l, &end, 16);
+                                       if (*end == ',') s_mhi = (uint32_t)strtoul(end + 1, 0, 16); } }
             if (s_mi == -2) { const char* e = getenv("SPU_MFCLOG_IMG"); s_mi = e ? atoi(e) : -1;
                               const char* m = getenv("SPU_MFCLOG_MAX"); s_mmax = m ? atol(m) : 20000;
                               const char* a = getenv("SPU_MFCLOG_EA");
@@ -923,7 +928,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
             int hit_ea = 0;
             for (int k = 0; k < s_nea; k++)
                 if ((ctx->mfc_eal & ~127u) == s_mea[k] || ((ctx->mfc_eal + ctx->mfc_size - 1u) & ~127u) == s_mea[k]) hit_ea = 1;
-            if (((s_mi >= 0 && ctx->image_id == s_mi) || hit_ea) && s_mn++ < s_mmax) {
+            const uint32_t mlsa = ctx->mfc_lsa & SPU_LS_MASK;
+            if (((s_mi >= 0 && ctx->image_id == s_mi) || hit_ea) &&
+                mlsa >= s_mlo && mlsa < s_mhi && s_mn++ < s_mmax) {
                 /* SPU_MFCLOG_BYTES=<n>: bytes of data per line (default 64,
                  * at most 256) -- a job object's fields past +0x40 were cut. */
                 static int s_mb = -1;
@@ -1504,6 +1511,26 @@ void spu_register_function(uint32_t addr, spu_fn fn)
         }
         return;
     }
+    /* SPU_NOLIFT=<image>:<hex addr>[,...]: leave these lifted functions out
+     * (an image of -1 matches any), so that code runs interpreted -- to find
+     * which lift of several changes behaviour without rebuilding. */
+    { static int s_n = -1; static struct { int img; uint32_t addr; } s_skip[64];
+      if (s_n < 0) {
+          s_n = 0;
+          const char* e = getenv("SPU_NOLIFT");
+          while (e && *e && s_n < 64) {
+              char* end;
+              s_skip[s_n].img = (int)strtol(e, &end, 10);
+              if (*end != ':') break;
+              s_skip[s_n].addr = (uint32_t)strtoul(end + 1, &end, 16);
+              s_n++;
+              e = (*end == ',') ? end + 1 : NULL;
+          }
+          if (s_n) fprintf(stderr, "[spu] SPU_NOLIFT: %d function(s) left to the interpreter\n", s_n);
+      }
+      for (int k = 0; k < s_n; k++)
+          if (s_skip[k].addr == addr && (s_skip[k].img < 0 || s_skip[k].img == s_reg_image))
+              return; }
     uint32_t i = s_registry_count;
     s_registry[i].addr = addr;
     s_registry[i].fn = fn;
@@ -1611,10 +1638,11 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * the image id its lifted functions were registered under. The MFC GET path
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
-typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; } spu_ovl_src;
+typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
+                 uint32_t pic_base; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
-#define SPU_OVL_SRC_MAX 128
+#define SPU_OVL_SRC_MAX 512
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
 
@@ -1624,6 +1652,8 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
+        s_ovl_src[s_ovl_src_count].span = 0;
+        s_ovl_src[s_ovl_src_count].pic_base = 0;
         s_ovl_src_count++;
     }
 }
@@ -1635,6 +1665,102 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
     if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
     spu_overlay_register_source(content_ea, image_id);
     s_ovl_src[s_ovl_src_count - 1].span = span;
+}
+
+/* A code fragment a job streams from content_ea into a buffer, at a local-store
+ * address that depends on what else the job loads. It was lifted position-
+ * independently (spu_lifter --pic) at lift_base: wherever the GET puts it,
+ * dispatch looks pc - lsa + lift_base up in its image and runs it with
+ * ctx->pic_delta = lsa - lift_base. */
+void spu_overlay_register_pic(uint32_t content_ea, uint32_t span, uint32_t lift_base, int image_id)
+{
+    if (!span || !lift_base || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
+    spu_overlay_register_region(content_ea, span, image_id);
+    s_ovl_src[s_ovl_src_count - 1].pic_base = lift_base & SPU_LS_MASK;
+}
+
+/* When each resident_code slot was last claimed, per SPU (see note_get). */
+static uint32_t s_code_seq[16][SPU_RESIDENT_CODE_SLOTS];
+static uint32_t s_code_clock;
+
+/* SPU_PIC_LOG=<n>: the first n claims, evictions and lookups of streamed code
+ * spans (resident_code), to see why a fragment ran interpreted. */
+static int spu_pic_log(void)
+{
+    static long s_n = -1;
+    if (s_n < 0) { const char* e = getenv("SPU_PIC_LOG"); s_n = e ? atol(e) : 0; }
+    if (s_n <= 0) return 0;
+    s_n--;
+    return 1;
+}
+
+/* spu_lookup restricted to one image: a position-independent image's lift
+ * addresses are not where it runs, so a wildcard (image 0) entry there means
+ * nothing. */
+static spu_fn spu_lookup_in_image(uint32_t addr, int image_id)
+{
+    for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
+        const spu_reg_entry* e = &s_registry[n - 1];
+        if (e->addr == addr && e->image_id == image_id) return e->fn;
+    }
+    return NULL;
+}
+
+/* The streamed code span (resident_code) that holds pc, if any: *owner is its
+ * image (0 when pc is in none), the result its function at pc. For a
+ * position-independent image this also sets ctx->pic_delta. Shared by the full
+ * resolver and the musttail fast path (spu_dispatch_mt.c). */
+spu_fn spu_resident_code_fn(spu_context* ctx, uint32_t pc, int* owner)
+{
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+        const int img = ctx->resident_code[slot].image_id;
+        if (!img || pc < ctx->resident_code[slot].lsa ||
+            pc - ctx->resident_code[slot].lsa >= ctx->resident_code[slot].size)
+            continue;
+        *owner = img;
+        if (!ctx->resident_code[slot].base)
+            return spu_lookup(pc, img);
+        const uint32_t d = ctx->resident_code[slot].lsa - ctx->resident_code[slot].base;
+        spu_fn fn = spu_lookup_in_image(pc - d, img);
+        if (fn) ctx->pic_delta = d;
+        if (spu_pic_log())
+            fprintf(stderr, "[spu-pic] lookup pc=0x%05X slot=%u img=%d span=0x%05X+0x%X -> 0x%05X %s\n",
+                    pc, slot, img, ctx->resident_code[slot].lsa, ctx->resident_code[slot].size,
+                    pc - d, fn ? "lifted" : "MISS");
+        return fn;
+    }
+    *owner = 0;
+    return NULL;
+}
+
+/* Declared in spu_interp.h. The interpreter asks this at every step, so it
+ * must answer what spu_indirect_branch would do: before it only saw the
+ * context's own image, and a job that fell to the interpreter at one unlifted
+ * address ran the rest of its body interpreted although every function of the
+ * resident job module (and of its code fragments) was lifted. */
+int spu_lifted_probe(spu_context* ctx, uint32_t lsa)
+{
+    lsa &= SPU_LS_MASK;
+    /* SPU_PROBE=<mask>: what besides the context's own image the interpreter
+     * may rejoin -- 1 streamed code spans, 2 the resident taskset task, 4 the
+     * resident overlay; 0 is the old answer. Rejoining the resident overlay
+     * (4) stalls Ascension at the end of loading, its post-process tasks
+     * parked in WAIT_SIGNAL (7 runs of 7 with 4 or 5 in the mask, 0 of 4 with
+     * 0 or 1): a job module's lifted function entered from interpreted code
+     * returns by host return, past the interpreted caller. Missing job-module
+     * entries go into the lift instead (jobmods_extra_funcs.json). Default 1. */
+    static int s_mask = -1;
+    if (s_mask < 0) { const char* e = getenv("SPU_PROBE"); s_mask = e && *e ? atoi(e) : 1; }
+    int owner = 0;
+    if (s_mask & 1) {
+        const uint32_t pic = ctx->pic_delta;
+        spu_fn fn = spu_resident_code_fn(ctx, lsa, &owner);
+        ctx->pic_delta = pic;             /* a probe; the dispatch sets it */
+        if (owner) return fn != NULL;
+    }
+    if ((s_mask & 2) && ctx->resident_task && spu_lookup(lsa, ctx->resident_task)) return 1;
+    if ((s_mask & 4) && ctx->resident_ovl && spu_lookup(lsa, ctx->resident_ovl)) return 1;
+    return spu_lifted_lookup(ctx, lsa) != NULL;
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -1788,13 +1914,17 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
-    for (unsigned slot = 0; slot < 4; ++slot) {
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
+            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base))) {
+            if (ctx->resident_code[slot].base && spu_pic_log())
+                fprintf(stderr, "[spu-pic] evict slot=%u img=%d span=0x%05X+0x%X by GET lsa=0x%05X ea=0x%08X size=0x%X\n",
+                        slot, ctx->resident_code[slot].image_id, base, ctx->resident_code[slot].size, lsa, ea, size);
             ctx->resident_code[slot].image_id = 0;
+        }
     }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
@@ -1803,16 +1933,44 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (hit) {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
-                for (unsigned slot = 0; slot < 4; ++slot) {
+                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
                         continue;
                     ctx->resident_code[slot].lsa = lsa;
-                    ctx->resident_code[slot].size = o->span;
+                    /* A position-independent fragment's span is an upper bound
+                     * (fragments are packed back to back); the GET that brings it
+                     * in is the whole fragment, so its size is the exact extent. */
+                    ctx->resident_code[slot].size = (o->pic_base && size < o->span) ? size : o->span;
                     ctx->resident_code[slot].source_ea = ea;
+                    ctx->resident_code[slot].base = o->pic_base;
                     ctx->resident_code[slot].image_id = o->image_id;
+                    s_code_seq[ctx->spu_id & 15][slot] = ++s_code_clock;
+                    if (o->pic_base && spu_pic_log())
+                        fprintf(stderr, "[spu-pic] claim slot=%u img=%d ea=0x%08X lsa=0x%05X size=0x%X spu=%u\n",
+                                slot, o->image_id, ea, lsa, ctx->resident_code[slot].size, ctx->spu_id);
                     return;
                 }
-                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                /* All spans taken: a job's fragments land at new addresses every
+                 * time and the old spans are only freed when a GET overlaps them.
+                 * Replace the one claimed longest ago: the running job's own
+                 * fragments (at most six) are always the newest. A span replaced
+                 * this way only loses its lift (its bytes fall to the
+                 * interpreter). The claim order is kept per SPU outside the
+                 * context; a shared spu_id only makes the choice worse, never
+                 * wrong. */
+                { unsigned slot = 0;
+                  const uint32_t* q = s_code_seq[ctx->spu_id & 15];
+                  for (unsigned k = 1; k < SPU_RESIDENT_CODE_SLOTS; ++k)
+                      if (q[k] < q[slot]) slot = k;
+                  s_code_seq[ctx->spu_id & 15][slot] = ++s_code_clock;
+                  if (o->pic_base && spu_pic_log())
+                      fprintf(stderr, "[spu-pic] replace slot=%u img=%d (was %d) ea=0x%08X lsa=0x%05X\n",
+                              slot, o->image_id, ctx->resident_code[slot].image_id, ea, lsa);
+                  ctx->resident_code[slot].lsa = lsa;
+                  ctx->resident_code[slot].size = (o->pic_base && size < o->span) ? size : o->span;
+                  ctx->resident_code[slot].source_ea = ea;
+                  ctx->resident_code[slot].base = o->pic_base;
+                  ctx->resident_code[slot].image_id = o->image_id; }
                 return;
             }
             if (ctx->resident_ovl != o->image_id) {
@@ -2195,6 +2353,20 @@ static int spu_smc_microstep(spu_context* ctx)
               fprintf(stderr, "[spu-smc] microstep img=%d ovl=%d start=0x%05X pc=0x%05X word 0x%08X"
                       " not in the microstep set -- handing to the interpreter (steps=%d)\n",
                       ctx->image_id, ctx->resident_ovl, ctx->pc & SPU_LS_MASK & ~3u, pc, w, steps);
+              /* SPU_SMC_LSDUMP=<dir>[,<ovl>]: the whole local store at that
+               * entry (first 32), so code a job builds or DMAs into its own
+               * buffers can be lifted at the address it runs from. */
+              static int s_ld = -1, s_ld_ovl = -1, s_ld_n; static char s_ld_dir[400];
+              if (s_ld < 0) { const char* e = getenv("SPU_SMC_LSDUMP"); s_ld = e && *e;
+                  if (s_ld) { snprintf(s_ld_dir, sizeof s_ld_dir, "%s", e);
+                              char* c = strchr(s_ld_dir, ','); if (c) { *c = 0; s_ld_ovl = atoi(c + 1); } } }
+              if (s_ld && s_ld_n < 32 && (s_ld_ovl < 0 || s_ld_ovl == ctx->resident_ovl)) {
+                  char path[512];
+                  snprintf(path, sizeof path, "%s/ls_ovl%d_%05X.bin", s_ld_dir, ctx->resident_ovl,
+                           ctx->pc & SPU_LS_MASK & ~3u);
+                  FILE* f = fopen(path, "wb");
+                  if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); s_ld_n++; }
+              }
           } }
         ctx->pc = pc;
         /* Stop at the drain's return point too: it sits mid-function, so it is
@@ -2202,6 +2374,41 @@ static int spu_smc_microstep(spu_context* ctx)
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
         const uint32_t return_pc = ctx->drain_ret_pc;
         uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
+        /* SPU_INTERP_HIST=1: instructions interpreted per (overlay, entry),
+         * the top 16 every 5 s -- where interpreter time actually goes (the
+         * microstep line above prints each entry once, not its cost). */
+        { static int s_h = -1; if (s_h < 0) s_h = getenv("SPU_INTERP_HIST") ? 1 : 0;
+          if (s_h) {
+              extern uint64_t g_spu_interp_steps;
+              extern unsigned long long ps3_ms_now(void);
+              enum { HN = 512 };
+              static struct { int ovl; uint32_t pc; unsigned long long steps, calls; } h[HN];
+              static int hn; static unsigned long long t0;
+              /* Unsynchronised (a diagnostic): counts can be lost between SPU
+               * threads, but every index stays below HN. */
+              int n = hn < HN ? hn : HN, k = 0;
+              for (; k < n; k++) if (h[k].pc == pc && h[k].ovl == ctx->resident_ovl) break;
+              if (k == n && n < HN) { h[n].ovl = ctx->resident_ovl; h[n].pc = pc; h[n].steps = h[n].calls = 0; hn = n + 1; }
+              if (k < HN) { h[k].steps += g_spu_interp_steps; h[k].calls++; }
+              unsigned long long now = ps3_ms_now();
+              if (!t0) t0 = now;
+              if (now - t0 >= 5000) {
+                  t0 = now;
+                  unsigned long long tot = 0;
+                  if (hn > HN) hn = HN;
+                  for (int i = 0; i < hn; i++) tot += h[i].steps;
+                  fprintf(stderr, "[interp-hist] %llu steps in 5 s, top entries:\n", tot);
+                  for (int r = 0; r < 16; r++) {
+                      int best = -1;
+                      for (int i = 0; i < hn; i++)
+                          if (h[i].steps && (best < 0 || h[i].steps > h[best].steps)) best = i;
+                      if (best < 0) break;
+                      fprintf(stderr, "[interp-hist]   ovl=%d start=0x%05X steps=%llu calls=%llu\n",
+                              h[best].ovl, h[best].pc, h[best].steps, h[best].calls);
+                      h[best].steps = 0;
+                  }
+                  for (int i = 0; i < hn; i++) h[i].steps = 0, h[i].calls = 0;
+              } } }
         /* A live interpreter rejoin is a transfer, not a host return. Nested
          * drains can repair an empty trampoline, but the top-level driver
          * otherwise ends the run before executing the lifted target.
@@ -2209,7 +2416,7 @@ static int spu_smc_microstep(spu_context* ctx)
          * stopped states and diagnostic exits keep their existing behavior. */
         if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
             (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
-            spu_lifted_lookup(ctx, ctx->pc)) {
+            spu_lifted_probe(ctx, ctx->pc)) {
             g_spu_trampoline_fn = spu_indirect_branch;
             return 1;
         }
@@ -2415,16 +2622,8 @@ void spu_indirect_branch(spu_context* ctx)
     /* The launched task owns the shared task-code region: resolve it there FIRST
      * so a co-resident task at the same LS base cannot shadow it. (resident_task
      * is 0 outside the region, so this only ever fires for genuine task code.) */
-    spu_fn fn = NULL;
     int code_owner = 0;
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
-            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
-            break;
-        }
-    }
+    spu_fn fn = spu_resident_code_fn(ctx, ctx->pc, &code_owner);
     if (!code_owner && ctx->resident_task)
         fn = spu_lookup(ctx->pc, ctx->resident_task);
     /* Resident overlay next: streamed code overwrote that LS range, so its lift

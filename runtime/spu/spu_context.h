@@ -285,10 +285,18 @@ typedef struct spu_context {
     int resident_ovl;
     /* Independently streamed code buffers can coexist with the policy overlay.
      * Each mapping records which translated image owns that local-store span. */
+    /* Eight: a WWS job can stream three code fragments into each of its
+     * two input buffers (God of War: Ascension, module 209). */
+#define SPU_RESIDENT_CODE_SLOTS 8
+    /* base: where a position-independent image was lifted (0 = lifted in
+     * place); code there runs with pic_delta = lsa - base. */
     struct {
-        uint32_t lsa, size, source_ea;
+        uint32_t lsa, size, source_ea, base;
         int image_id;
-    } resident_code[4];
+    } resident_code[SPU_RESIDENT_CODE_SLOTS];
+    /* Displacement of the position-independent code running now (lifter
+     * --pic): set by spu_indirect_branch when it enters such an image. */
+    uint32_t pic_delta;
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the
