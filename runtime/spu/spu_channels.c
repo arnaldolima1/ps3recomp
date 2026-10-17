@@ -1514,6 +1514,41 @@ static inline uint32_t spu_fn_hash(uint32_t addr)
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
 
+/* One bit per LS word for each image id: is a lifted function registered at
+ * this address? The interpreter asks spu_lifted_probe at every instruction,
+ * and almost every answer is "no" -- which a bit test gives without the three
+ * hash lookups. 8 KB per image that registers anything. */
+#define SPU_FN_BITS_IMAGES 1024
+static uint8_t* s_fn_bits[SPU_FN_BITS_IMAGES];
+static void spu_fn_bits_set(int img, uint32_t addr)
+{
+    if (img < 0 || img >= SPU_FN_BITS_IMAGES) return;
+    if (!s_fn_bits[img]) s_fn_bits[img] = (uint8_t*)calloc(SPU_LS_SIZE / 32, 1);
+    if (!s_fn_bits[img]) return;
+    const uint32_t w = (addr & SPU_LS_MASK) >> 2;
+    s_fn_bits[img][w >> 3] |= (uint8_t)(1u << (w & 7));
+}
+static inline int spu_fn_bits_test(int img, uint32_t addr)
+{
+    if (img < 0 || img >= SPU_FN_BITS_IMAGES || !s_fn_bits[img]) return 0;
+    const uint32_t w = (addr & SPU_LS_MASK) >> 2;
+    return (s_fn_bits[img][w >> 3] >> (w & 7)) & 1;
+}
+
+/* The next lifted entry of image img above addr (SPU_LS_SIZE if none): where
+ * the lifted function starting at addr ends (spu_shadow_check). */
+uint32_t spu_fn_next_entry(int img, uint32_t addr)
+{
+    if (img < 0 || img >= SPU_FN_BITS_IMAGES || !s_fn_bits[img]) return SPU_LS_SIZE;
+    for (uint32_t a = (addr & SPU_LS_MASK & ~3u) + 4; a < SPU_LS_SIZE; a += 4)
+        if (spu_fn_bits_test(img, a)) return a;
+    return SPU_LS_SIZE;
+}
+
+/* The title's default SPU_NOLIFT list; a title defines its own to override
+ * this weak empty one (God of War: Ascension: host/ascension_defaults.cpp). */
+__attribute__((weak)) const char* const spu_title_nolift = 0;
+
 void spu_register_function(uint32_t addr, spu_fn fn)
 {
     if (s_registry_count >= SPU_FN_REGISTRY_MAX) {
@@ -1540,7 +1575,10 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     { static int s_n = -1; static struct { int img; uint32_t addr; } s_skip[64];
       if (s_n < 0) {
           s_n = 0;
+          /* A title may name its own default (spu_title_nolift, a weak symbol
+           * it defines); SPU_NOLIFT, even empty, replaces it. */
           const char* e = getenv("SPU_NOLIFT");
+          if (!e) e = spu_title_nolift;
           while (e && *e && s_n < 64) {
               char* end;
               s_skip[s_n].img = (int)strtol(e, &end, 10);
@@ -1554,6 +1592,7 @@ void spu_register_function(uint32_t addr, spu_fn fn)
       for (int k = 0; k < s_n; k++)
           if (s_skip[k].addr == addr && (s_skip[k].img < 0 || s_skip[k].img == s_reg_image))
               return; }
+    spu_fn_bits_set(s_reg_image, addr);
     uint32_t i = s_registry_count;
     s_registry[i].addr = addr;
     s_registry[i].fn = fn;
@@ -1782,6 +1821,16 @@ int spu_lifted_probe(spu_context* ctx, uint32_t lsa)
      * to lifted code. Default 9 (1 | 8). */
     static int s_mask = -1;
     if (s_mask < 0) { const char* e = getenv("SPU_PROBE"); s_mask = e && *e ? atoi(e) : 9; }
+    /* Fast "no": no image this context could dispatch to has a function at
+     * lsa, and lsa is in no streamed code span (whose lifts sit elsewhere). */
+    {   int spans = 0;
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+            if (ctx->resident_code[slot].image_id &&
+                lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) { spans = 1; break; }
+        if (!spans && ctx->image_id > 0 &&   /* image 0 matches every image's functions */
+            !spu_fn_bits_test(ctx->image_id, lsa) && !spu_fn_bits_test(0, lsa) &&
+            !spu_fn_bits_test(ctx->resident_ovl, lsa) && !spu_fn_bits_test(ctx->resident_task, lsa))
+            return 0; }
     int owner = 0;
     if (s_mask & 1) {
         const uint32_t pic = ctx->pic_delta;
@@ -1792,6 +1841,29 @@ int spu_lifted_probe(spu_context* ctx, uint32_t lsa)
     if ((s_mask & 2) && ctx->resident_task && spu_lookup(lsa, ctx->resident_task)) return 1;
     if (((s_mask & 4) || ((s_mask & 8) && !ctx->int_enable)) &&
         ctx->resident_ovl && spu_lookup(lsa, ctx->resident_ovl)) return 1;
+    /* SPU_REJOIN=<ovl>:<lo>-<hi>[,...] (hex LS addresses): rejoin the resident
+     * overlay's lifted functions in these ranges only, whatever the mask --
+     * to find, by halving, which lifted function behaves unlike the
+     * interpreter on a path only the interpreter ever ran. */
+    { static int s_rn = -1; static struct { int ovl; uint32_t lo, hi; } s_rj[16];
+      if (s_rn < 0) {
+          s_rn = 0;
+          const char* e = getenv("SPU_REJOIN");
+          while (e && *e && s_rn < 16) {
+              char* end;
+              s_rj[s_rn].ovl = (int)strtol(e, &end, 10);
+              if (*end != ':') break;
+              s_rj[s_rn].lo = (uint32_t)strtoul(end + 1, &end, 16);
+              s_rj[s_rn].hi = s_rj[s_rn].lo;
+              if (*end == '-') s_rj[s_rn].hi = (uint32_t)strtoul(end + 1, &end, 16);
+              s_rn++;
+              e = (*end == ',') ? end + 1 : NULL;
+          }
+      }
+      for (int k = 0; k < s_rn; k++)
+          if (ctx->resident_ovl == s_rj[k].ovl && lsa >= s_rj[k].lo && lsa <= s_rj[k].hi &&
+              spu_lookup(lsa, ctx->resident_ovl))
+              return 1; }
     return spu_lifted_lookup(ctx, lsa) != NULL;
 }
 

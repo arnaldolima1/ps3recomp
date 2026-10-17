@@ -95,6 +95,8 @@ static void spu_job_hist_step(const spu_context* ctx)
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     spu_job_hist_step(ctx);
+    { extern void spu_shadow_check(spu_context*, void (*)(spu_context*));
+      spu_shadow_check(ctx, (void (*)(spu_context*))fn); }
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
@@ -319,6 +321,14 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
 void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
+    /* SPU_IRQ_DELIVER=0: never take an SPU interrupt. God of War: Ascension's
+     * Wws job manager polls its DMA-list stalls when it is not interrupted --
+     * a run whose job code is interpreted takes none at all and plays -- and
+     * taking them inside lifted job code (module 214's 0x4414-0x447C window)
+     * stops the game at the end of loading. */
+    { static int s_deliver = -1;
+      if (s_deliver < 0) { const char* e = getenv("SPU_IRQ_DELIVER"); s_deliver = !(e && *e == '0'); }
+      if (!s_deliver) return tf; }
     /* Stall-and-notify still settling: let the SPU run on (see above). */
     if (g_sn_defer && g_sn_defer_ctx == (void*)ctx) {
         if (--g_sn_defer == 0) g_sn_defer_ctx = 0;

@@ -608,3 +608,93 @@ void spu_dispatch(spu_context* ctx, uint32_t target) {
         target = next;
     }
 }
+
+/* SPU_SHADOW=<ovl>:<lo>-<hi> (hex LS): before the drain runs a lifted function
+ * of that resident overlay starting in [lo, hi], run it twice on copies of the
+ * context -- the lifted C and the interpreter, up to the next lifted entry --
+ * and report where the two disagree (exit pc, registers, local store). For
+ * code the interpreter has always run and the lift never had: which lifted
+ * function of a job body computes something else. Functions whose path makes
+ * a channel access, a call or a stop are skipped (their effects would happen
+ * twice); each function is checked at most SPU_SHADOW_MAX times (default 4). */
+extern void (*spu_lookup(uint32_t addr, int image_id))(spu_context*);
+void spu_shadow_check(spu_context* ctx, void (*fn)(spu_context*))
+{
+    static int s_on = -1, s_ovl; static uint32_t s_lo, s_hi; static long s_max;
+    if (s_on < 0) {
+        const char* e = getenv("SPU_SHADOW"); char* end;
+        s_on = 0;
+        if (e) { s_ovl = (int)strtol(e, &end, 10);
+                 if (*end == ':') { s_lo = (uint32_t)strtoul(end + 1, &end, 16);
+                                    s_hi = (*end == '-') ? (uint32_t)strtoul(end + 1, 0, 16) : s_lo;
+                                    s_on = 1; } }
+        const char* m = getenv("SPU_SHADOW_MAX"); s_max = m ? atol(m) : 4;
+    }
+    if (!s_on || ctx->resident_ovl != s_ovl || ctx->ls != ctx->ls_store) return;
+    const uint32_t pc0 = ctx->pc & SPU_LS_MASK;
+    if (pc0 < s_lo || pc0 > s_hi || !fn || fn != spu_lookup(pc0, s_ovl)) return;
+    static unsigned char s_seen[0x10000];          /* per LS word / 4, saturating */
+    if (s_seen[pc0 >> 2] >= s_max) return;
+    s_seen[pc0 >> 2]++;
+    static _Thread_local spu_context* SH_L; static _Thread_local spu_context* SH_I;
+    if (!SH_L) { SH_L = (spu_context*)malloc(sizeof *SH_L); SH_I = (spu_context*)malloc(sizeof *SH_I); }
+    if (!SH_L || !SH_I) return;
+    memcpy(SH_I, ctx, sizeof *SH_I); SH_I->ls = SH_I->ls_store;
+    /* interpreter first: it decides whether the path is safe to run twice */
+    /* A lifted function spans [pc0, next entry) and leaves only when control
+     * does; branches inside it, back to its start included, stay in it. */
+    extern uint32_t spu_fn_next_entry(int img, uint32_t addr);
+    const uint32_t fn_end = spu_fn_next_entry(s_ovl, pc0);
+    /* Calls are followed: the lifted function runs its callees as C calls, so
+     * the interpreter follows them too and only stops when, back at depth 0,
+     * control leaves the function. A return is control reaching the address a
+     * call left in its link register. */
+    static long s_skip_chan, s_skip_stop, s_skip_long;
+    uint32_t rstack[32]; int depth = 0;
+    int steps = 0, ok = 1;
+    for (; steps < 200000; steps++) {
+        const uint32_t pc = SH_I->pc & SPU_LS_MASK;
+        while (depth && pc == rstack[depth - 1]) depth--;
+        if (steps && !depth && (pc < pc0 || pc >= fn_end)) break;   /* left the function */
+        const uint8_t* q = SH_I->ls + pc;
+        const uint32_t w = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+        const uint32_t op11 = w >> 21, op9 = w >> 23;
+        if (op11 == 0x00D || op11 == 0x00F || op11 == 0x10D) { ok = 0; s_skip_chan++; break; }
+        if (op11 == 0x000 || op11 == 0x140 || op11 == 0x1AA || op11 == 0x1AB) { ok = 0; s_skip_stop++; break; }
+        const int call = (op11 == 0x1A9 || op9 == 0x066 || op9 == 0x062);
+        if (call && depth < 32) rstack[depth++] = (pc + 4) & SPU_LS_MASK;
+        if (spu_step(SH_I)) { ok = 0; s_skip_stop++; break; }
+        /* brsl to the next instruction is a pc getter, not a call */
+        if (call && (SH_I->pc & SPU_LS_MASK) == ((pc + 4) & SPU_LS_MASK)) depth--;
+    }
+    if (steps >= 200000) { s_skip_long++; return; }
+    if (!ok) {
+        static long s_n; if ((++s_n % 500) == 1)
+            fprintf(stderr, "[shadow] skipped: channel %ld, stop/iret %ld, too long %ld\n",
+                    s_skip_chan, s_skip_stop, s_skip_long);
+        return;
+    }
+    memcpy(SH_L, ctx, sizeof *SH_L); SH_L->ls = SH_L->ls_store;
+    void (*saved_tf)(spu_context*) = g_spu_trampoline_fn;
+    g_spu_trampoline_fn = 0;
+    fn(SH_L);
+    g_spu_trampoline_fn = saved_tf;
+    static long s_reports; static long s_checked;
+    s_checked++;
+    char line[1200]; int o = 0;
+    if ((SH_L->pc & SPU_LS_MASK) != (SH_I->pc & SPU_LS_MASK))
+        o += snprintf(line + o, sizeof line - o, " pc lifted=%05X interp=%05X",
+                      SH_L->pc & SPU_LS_MASK, SH_I->pc & SPU_LS_MASK);
+    for (int r = 0; r < 128 && o < (int)sizeof line - 120; r++)
+        if (memcmp(&SH_L->gpr[r], &SH_I->gpr[r], 16))
+            o += snprintf(line + o, sizeof line - o, " r%d lifted=%08X%08X%08X%08X interp=%08X%08X%08X%08X", r,
+                          SH_L->gpr[r]._u32[0], SH_L->gpr[r]._u32[1], SH_L->gpr[r]._u32[2], SH_L->gpr[r]._u32[3],
+                          SH_I->gpr[r]._u32[0], SH_I->gpr[r]._u32[1], SH_I->gpr[r]._u32[2], SH_I->gpr[r]._u32[3]);
+    for (uint32_t a = 0; a < SPU_LS_SIZE && o < (int)sizeof line - 40; a += 16)
+        if (memcmp(SH_L->ls_store + a, SH_I->ls_store + a, 16)) {
+            o += snprintf(line + o, sizeof line - o, " LS@%05X", a); break; }
+    if (o && s_reports++ < 40)
+        fprintf(stderr, "[shadow] fn 0x%05X (%d steps) differs:%s\n", pc0, steps, line);
+    else if (!o && (s_checked % 200) == 1)
+        fprintf(stderr, "[shadow] %ld functions checked, %ld differ\n", s_checked, s_reports);
+}
