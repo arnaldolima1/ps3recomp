@@ -89,9 +89,51 @@ static void fs_normalize_sep(char* p) {
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
+/* PS3_MODS=<dir>[;<dir>...]: mod folders laid over the game's USRDIR, the
+ * first listed winning. Each mirrors USRDIR (a mod that replaces
+ * USRDIR/GAME.PSARC holds <mod>/GAME.PSARC); a file a mod has is opened from
+ * the mod, anything else from the game. Only paths under a USRDIR are
+ * overlaid, so saves and system files never are. */
+static void ps3_vfs_mod_overlay(char* path, size_t cap)
+{
+    static char mods[2048]; static int init = 0;
+    if (!init) {
+        const char* e = getenv("PS3_MODS");
+        if (e) { strncpy(mods, e, sizeof mods - 1); mods[sizeof mods - 1] = 0; }
+        init = 1;
+    }
+    if (!mods[0]) return;
+    const char* u = strstr(path, "/USRDIR/");
+    if (!u) u = strstr(path, "\\USRDIR\\");
+    if (!u) return;
+    const char* rel = u + 8;
+    struct stat st;
+    for (const char* m = mods; *m; ) {
+        const char* end = strchr(m, ';');
+        size_t n = end ? (size_t)(end - m) : strlen(m);
+        if (n) {
+            char alt[1024];
+            if (n + 1 + strlen(rel) < sizeof alt) {
+                memcpy(alt, m, n);
+                snprintf(alt + n, sizeof alt - n, "/%s", rel);
+                fs_normalize_sep(alt);
+                if (stat(alt, &st) == 0) {
+                    static int logged = 0;
+                    if (logged++ < 32) printf("[mods] %s -> %s\n", rel, alt);
+                    snprintf(path, cap, "%s", alt);
+                    return;
+                }
+            }
+        }
+        if (!end) break;
+        m = end + 1;
+    }
+}
+
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     struct stat st;
+    if (path && *path) ps3_vfs_mod_overlay(path, cap);
     if (!path || !*path || stat(path, &st) == 0)
         return;
     char* p = strstr(path, "/PS3_GAME/");

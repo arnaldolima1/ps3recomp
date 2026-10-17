@@ -137,7 +137,16 @@ static int pad_host_window_focused(void)
     if (!fg) return 0;
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
-    return pid == GetCurrentProcessId();
+    if (pid == GetCurrentProcessId()) return 1;
+    /* Rendering inside a launcher's window (PS3_PARENT_HWND): that window in
+     * front counts as ours. */
+    { static HWND host = (HWND)-1;
+      if (host == (HWND)-1) {
+          const char* e = getenv("PS3_PARENT_HWND");
+          HWND p = e && *e ? (HWND)(uintptr_t)strtoull(e, NULL, 0) : NULL;
+          host = p ? GetAncestor(p, GA_ROOT) : NULL;
+      }
+      return host && fg == host; }
 }
 
 static void pad_poll_keyboard(void)

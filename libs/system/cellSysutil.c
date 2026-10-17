@@ -268,12 +268,22 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 
     s32 v = 0;
     switch (id) {
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = CELL_SYSUTIL_LANG_ENGLISH_US;
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
-        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
-        break;
+    /* PS3_SYS_LANG=<n>: the console language, as CELL_SYSUTIL_LANG_* numbers
+     * it (0 Japanese, 1 English US, 2 Spanish, 3 French, 4 German, 5 Italian,
+     * 6 Dutch, 7 Portuguese, 8 Russian, ... 16 Polish, 17 Portuguese BR,
+     * 18 English UK, 19 Turkish). Titles pick their text, subtitle and voice
+     * language from it. PS3_ENTER_BUTTON=circle|cross: which face button
+     * confirms (Japanese consoles use circle). Defaults: English US, cross. */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG: {
+        const char* e = getenv("PS3_SYS_LANG");
+        v = (e && *e >= '0' && *e <= '9') ? atoi(e) : CELL_SYSUTIL_LANG_ENGLISH_US;
+        if (v < 0 || v > 19) v = CELL_SYSUTIL_LANG_ENGLISH_US;
+        break; }
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN: {
+        const char* e = getenv("PS3_ENTER_BUTTON");
+        v = (e && (e[0] == 'c' || e[0] == 'C') && (e[1] == 'i' || e[1] == 'I'))
+            ? CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CIRCLE : CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
+        break; }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:       v = 0; break; /* UTC */

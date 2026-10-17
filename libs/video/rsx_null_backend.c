@@ -52,8 +52,11 @@ static NullBackendState s_state;
 
 static int s_present_suppressed = 0;
 
+#include "rsx_host_window.h"
+
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (rsx_host_window_message(hwnd, msg, wp, lp)) return 0;
     switch (msg) {
     case WM_CLOSE:
         s_state.window_closed = 1;
@@ -93,7 +96,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
+        if (wp == VK_ESCAPE && rsx_host_window_esc_quits()) {
             s_state.window_closed = 1;
             DestroyWindow(hwnd);
         }
@@ -247,17 +250,8 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     wc.lpszClassName = "ps3recomp_null";
     RegisterClassExA(&wc);
 
-    /* Compute window size from client area */
-    RECT wr = {0, 0, (LONG)width, (LONG)height};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-
-    s_state.hwnd = CreateWindowExA(
-        0, "ps3recomp_null",
-        title ? title : "ps3recomp",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        wr.right - wr.left, wr.bottom - wr.top,
-        NULL, NULL, GetModuleHandle(NULL), NULL);
+    /* The window (size, full screen, embedding in a launcher): rsx_host_window.h */
+    s_state.hwnd = rsx_host_window_create("ps3recomp_null", width, height, title ? title : "ps3recomp");
 
     if (!s_state.hwnd) {
         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
@@ -297,6 +291,7 @@ void rsx_null_backend_shutdown(void)
 int rsx_null_backend_pump_messages(void)
 {
     MSG msg;
+    if (rsx_host_window_follow(s_state.hwnd)) s_state.window_closed = 1;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT)
             return -1;

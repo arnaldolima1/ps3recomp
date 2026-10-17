@@ -490,8 +490,11 @@ static u32    s_lock_n  = 0;
  * Win32 window
  * -----------------------------------------------------------------------*/
 
+#include "rsx_host_window.h"
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (rsx_host_window_message(hwnd, msg, wp, lp)) return 0;
     switch (msg) {
     case WM_CLOSE:
         s_d3d.window_closed = 1;
@@ -501,7 +504,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PostQuitMessage(0);
         return 0;
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
+        if (wp == VK_ESCAPE && rsx_host_window_esc_quits()) {
             s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
         }
@@ -521,18 +524,10 @@ static HWND create_window(u32 width, u32 height, const char* title)
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
 
-    RECT wr = {0, 0, (LONG)width, (LONG)height};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-    return CreateWindowExA(
-        0, "ps3recomp_d3d12",
-        title ? title : "ps3recomp (D3D12)",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        wr.right - wr.left, wr.bottom - wr.top,
-        NULL, NULL, GetModuleHandle(NULL), NULL);
+    return rsx_host_window_create("ps3recomp_d3d12", width, height,
+                                  title ? title : "ps3recomp (D3D12)");
 }
 
 /* ---------------------------------------------------------------------------
@@ -6688,6 +6683,7 @@ void rsx_d3d12_backend_shutdown(void)
 int rsx_d3d12_backend_pump_messages(void)
 {
     MSG msg;
+    if (rsx_host_window_follow(s_d3d.hwnd)) s_d3d.window_closed = 1;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
         TranslateMessage(&msg);
